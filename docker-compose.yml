@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: autoapply-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autoapply
+      POSTGRES_PASSWORD: autoapply
+      POSTGRES_DB: autoapply
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: autoapply-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
