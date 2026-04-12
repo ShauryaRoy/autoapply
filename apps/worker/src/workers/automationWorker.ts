@@ -130,18 +130,18 @@ export async function runAutomation(job: Job): Promise<void> {
 
   // ── STEP: form_filled ──────────────────────────────────────────────────
   if (step === "form_filled") {
-    const profile = (metadata?.profile as Record<string, string> | undefined) ?? {};
+    const profile = (metadata?.profile as any) ?? {};
     const answers = (metadata?.answers as Record<string, string> | undefined) ?? {};
     const resumeText = String(metadata?.resumeText ?? "");
 
-    console.log(`   → Starting AI form fill for ${profile.firstName} ${profile.lastName} (${profile.email})`);
+    console.log(`   → Starting AI form fill for ${profile.personal?.firstName} ${profile.personal?.lastName} (${profile.personal?.email})`);
     console.log(`     Resume: ${resumeText.length} chars, Answers: ${Object.keys(answers).length}`);
 
     await workerLogEvent({
       applicationId,
       step: "form_filled",
-      message: `Starting AI-powered form fill for ${profile.firstName ?? "Applicant"} ${profile.lastName ?? ""}`,
-      payloadJson: { name: `${profile.firstName} ${profile.lastName}`, email: profile.email }
+      message: `Starting AI-powered form fill for ${profile.personal?.firstName ?? "Applicant"} ${profile.personal?.lastName ?? ""}`,
+      payloadJson: { name: `${profile.personal?.firstName} ${profile.personal?.lastName}`, email: profile.personal?.email }
     }).catch(() => {});
 
     // Start live preview polling so the user can watch in real-time
@@ -156,13 +156,17 @@ export async function runAutomation(job: Job): Promise<void> {
       const result = await intelligentlyFillPage(
         page,
         {
-          firstName: profile.firstName ?? "",
-          lastName: profile.lastName ?? "",
-          email: profile.email ?? "",
-          phone: profile.phone ?? "",
-          location: profile.location ?? "",
-          linkedIn: profile.linkedIn,
-          portfolio: profile.portfolio,
+          personal: {
+            firstName: profile.personal?.firstName ?? "",
+            lastName: profile.personal?.lastName ?? "",
+            email: profile.personal?.email ?? "",
+            phone: profile.personal?.phone ?? "",
+            location: profile.personal?.location ?? "",
+          },
+          education: profile.education ?? [],
+          experience: profile.experience ?? [],
+          skills: profile.skills ?? [],
+          links: profile.links ?? {},
           resumeText,
           yearsExperience: answers["years-experience"],
           coverLetter: answers["cover-letter"],

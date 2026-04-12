@@ -3,7 +3,59 @@ import { CreateApplicationSchema, type ApplicationState } from "@autoapply/share
 import { prisma } from "../db/prisma.js";
 import { OrchestratorService } from "../services/orchestratorService.js";
 import { JobParserService } from "../services/jobParserService.js";
-import type { AuthClaims } from "../auth/jwt.js";
+import { getProfileByUserId } from "../services/profileService.js";
+
+function toYear(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const match = value.match(/(?:19|20)\d{2}/);
+    return match ? Number(match[0]) : null;
+  }
+  return null;
+}
+
+function buildWorkerMetadata(profile: Awaited<ReturnType<typeof getProfileByUserId>>, fallbackMetadata?: Record<string, unknown>): Record<string, unknown> {
+  const skills = (profile.skills ?? [])
+    .map((entry) => entry.name)
+    .filter((name): name is string => typeof name === "string" && !!name.trim());
+
+  return {
+    ...(fallbackMetadata ?? {}),
+    profile: {
+      personal: {
+        firstName: profile.firstName,
+        lastName: profile.lastName,
+        email: profile.email,
+        phone: profile.phone,
+        location: profile.location
+      },
+      education: (profile.education ?? []).map((entry) => ({
+        institution: entry.school || null,
+        field_of_study: entry.major || null,
+        degree: entry.degree || null,
+        start_year: toYear(entry.startYear),
+        end_year: toYear(entry.endYear)
+      })),
+      experience: (profile.experience ?? []).map((entry) => ({
+        job_title: entry.title || null,
+        company: entry.company || null,
+        location: entry.location || null,
+        description: entry.description || null,
+        start_year: toYear(entry.startYear),
+        end_year: entry.current ? null : toYear(entry.endYear),
+        current: !!entry.current
+      })),
+      skills,
+      links: {
+        linkedin: profile.links?.linkedin || profile.linkedIn || null,
+        portfolio: profile.links?.portfolio || profile.portfolio || null,
+        github: profile.links?.github || null
+      }
+    },
+    resumeText: profile.resumeText ?? "",
+    answers: profile.answers ?? {}
+  };
+}
 
 export function createApplicationRouter(): Router {
   const router = Router();
@@ -13,16 +65,18 @@ export function createApplicationRouter(): Router {
   router.post("/", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const payload = CreateApplicationSchema.parse(req.body);
-      const user = (req as Request & { user?: AuthClaims }).user;
+      const user = req.user;
       if (!user) {
         res.status(401).json({ message: "Unauthorized" });
         return;
       }
       const atsProvider = parser.detectAtsProvider(payload.jobUrl);
+      const authoritativeProfile = await getProfileByUserId(user.id);
+      const snapshotMetadata = buildWorkerMetadata(authoritativeProfile, payload.metadata);
 
       const run = await prisma.applicationRun.create({
         data: {
-          userId: user.sub,
+          userId: user.id,
           jobUrl: payload.jobUrl,
           targetRole: payload.targetRole,
           status: "queued",
@@ -31,7 +85,7 @@ export function createApplicationRouter(): Router {
           retries: 0,
           maxRetries: 5,
           checkpointJson: {
-            metadata: payload.metadata ?? {}
+            metadata: snapshotMetadata
           } as never
         }
       });
@@ -44,7 +98,7 @@ export function createApplicationRouter(): Router {
         retries: 0,
         maxRetries: 5,
         checkpoint: {
-          metadata: payload.metadata ?? {}
+          metadata: snapshotMetadata
         }
       };
 

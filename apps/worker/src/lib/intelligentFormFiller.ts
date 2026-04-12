@@ -32,13 +32,35 @@ interface FillInstruction {
 }
 
 interface ApplicantData {
-  firstName: string;
-  lastName: string;
-  email: string;
-  phone: string;
-  location: string;
-  linkedIn?: string;
-  portfolio?: string;
+  personal: {
+    firstName: string | null;
+    lastName: string | null;
+    email: string | null;
+    phone: string | null;
+    location: string | null;
+  };
+  education: Array<{
+    institution: string | null;
+    field_of_study: string | null;
+    degree: string | null;
+    start_year: number | null;
+    end_year: number | null;
+  }>;
+  experience: Array<{
+    job_title: string | null;
+    company: string | null;
+    location: string | null;
+    description: string | null;
+    start_year: number | null;
+    end_year: number | null;
+    current: boolean;
+  }>;
+  skills: string[];
+  links: {
+    linkedin?: string | null;
+    portfolio?: string | null;
+    github?: string | null;
+  };
   resumeText: string;
   yearsExperience?: string;
   coverLetter?: string;
@@ -305,59 +327,51 @@ async function askGeminiWhatToFill(
     }
   }
 
+  const educationBlock = applicant.education.map(e => `- ${e.degree} in ${e.field_of_study} from ${e.institution} (${e.start_year}-${e.end_year ?? "Present"})`).join("\n");
+  const experienceBlock = applicant.experience.map(e => `- ${e.job_title} at ${e.company} (${e.start_year}-${e.end_year ?? "Present"}): ${e.description?.slice(0, 200)}...`).join("\n");
+
   const prompt = `You are an AI job application assistant. You are filling out a job application form.
 
 PAGE: "${pageTitle}" (${pageUrl})
 
-APPLICANT INFO:
-- Name: ${applicant.firstName} ${applicant.lastName}
-- Email: ${applicant.email}
-- Phone: ${applicant.phone}
-- Location: ${applicant.location}
-${applicant.linkedIn ? `- LinkedIn: ${applicant.linkedIn}` : ""}
-${applicant.portfolio ? `- Portfolio: ${applicant.portfolio}` : ""}
-${applicant.yearsExperience ? `- Years of experience: ${applicant.yearsExperience}` : ""}
+APPLICANT PROFILE:
+- Name: ${applicant.personal.firstName} ${applicant.personal.lastName}
+- Email: ${applicant.personal.email}
+- Phone: ${applicant.personal.phone}
+- Location: ${applicant.personal.location}
+- Skills: ${applicant.skills.join(", ")}
+${applicant.links.linkedin ? `- LinkedIn: ${applicant.links.linkedin}` : ""}
+${applicant.links.portfolio ? `- Portfolio: ${applicant.links.portfolio}` : ""}
+
+EDUCATION:
+${educationBlock}
+
+EXPERIENCE:
+${experienceBlock}
 
 ${answersBlock}
 
-RESUME:
+RESUME TEXT (FOR CONTEXT ONLY):
 ${applicant.resumeText.slice(0, 3000)}
-
-COVER LETTER (if needed):
-${applicant.coverLetter ?? "Generate a brief, professional cover letter if any field asks for one."}
 
 FORM FIELDS FOUND ON PAGE:
 ${fieldDescriptions}
 
 INSTRUCTIONS:
-For each field, decide what to fill. Return a JSON array of objects, each with:
-- "index": the field index number
-- "selector": the CSS selector to target it
-- "action": one of "type", "select", "upload", "check", "click", "skip"
-  - "type" for text inputs and textareas
-  - "select" for dropdowns (value should be the option text)
-  - "upload" for file inputs (value should be "resume")
-  - "check" for checkboxes that should be checked
-  - "skip" for fields that don't need filling
-- "value": what to put in the field
+For each field, decide what to fill. Return a JSON array of objects.
 
-RULES:
-1. Fill ALL visible required fields to the best of your ability.
-2. For name fields: use "${applicant.firstName}" and "${applicant.lastName}".
-3. For email: use "${applicant.email}".
-4. For phone: use "${applicant.phone}". For "Country Phone Code" dropdowns, DO NOT paste the entire phone number. Extract or match the exact country code (e.g. "+91", "India (+91)").
-5. For location/city dropdowns or inputs: use "${applicant.location}".
-6. For Address Lines (Street, Line 1, Line 2) and Postal/Zip codes: ALWAYS check the SPECIFIC FORM ANSWERS first. If no valid street address is specifically provided in the answers, make a highly realistic generic guess for the city (e.g. "Main Street", "123 Business Rd"). If you don't know the exact Postal Code for the user's location, invent a highly accurate valid zip code for the city/country (e.g., "560001" for Bengaluru). DO NOT mistakenly paste the city name into postal codes, street addresses, or country codes!
-7. For "cover letter" or long text boxes: write a compelling, specific 3-4 paragraph cover letter.
-8. For "years of experience": use "${applicant.yearsExperience ?? "5"}".
-9. For dropdowns: pick the most appropriate option from the available options.
-10. For file upload fields: set action to "upload" and value to "resume".
-11. For checkboxes about agreeing to terms: set action to "check".
-12. For salary expectation fields: write "Open to discussion".
-13. Keep answers professional, concise, and specific.
-14. If the field asks a specific question (like Visa, Sponsorship, Pronouns, Gender, Disability, Veteran status), strongly prefer the SPECIFIC FORM ANSWERS block. If missing, make the most statistically likely generic guess that won't hinder the application.
-
-Return ONLY a JSON array, no markdown, no explanations.`;
+CRITICAL RULES:
+1. NEVER, EVER paste the entire resume text into a single field unless it's a specific "Paste your resume here" area.
+2. For Experience/Education fields: Use the structured data above. Provide concise summaries or specific titles/companies/dates as requested by the field label.
+3. If a field asks for "Experience" or "Work History" as a single textarea, summarize the top 3 roles concisely. DO NOT dump the whole resume.
+4. For text fields (School, Major, Title): Use MAXIMUM 80 characters.
+5. Fill ALL visible required fields.
+6. For name: use "${applicant.personal.firstName}" and "${applicant.personal.lastName}".
+7. For phone: use "${applicant.personal.phone}". Match country codes exactly in selects.
+8. For address/postal: Check SPECIFIC FORM ANSWERS first. If missing, use "${applicant.personal.location}" or realistic defaults for that city.
+9. For "cover letter": Write a compelling 2-3 paragraph letter if required.
+10. For salary: "Open to discussion".
+11. Return ONLY a JSON array.`;
 
   try {
     console.log("   🧠 Calling Gemini to analyze form fields...");
@@ -408,19 +422,19 @@ function ruleFill(fields: FormField[], applicant: ApplicantData): FillInstructio
     } else if (f.tag === "textarea" || f.type === "textarea") {
       if (hint.match(/cover|letter|why|about|yourself|message|interest/i)) {
         action = "type";
-        value = applicant.coverLetter ?? `Dear Hiring Manager,\n\nI am excited to apply for this position. With ${applicant.yearsExperience ?? "several"} years of experience, I am confident I can make a meaningful contribution to your team.\n\nI bring a strong background in building reliable systems and collaborating across teams. I am eager to learn about this opportunity and discuss how my skills align with your needs.\n\nBest regards,\n${applicant.firstName} ${applicant.lastName}`;
+        value = applicant.coverLetter ?? `Dear Hiring Manager,\n\nI am excited to apply for this position. I am confident I can make a meaningful contribution to your team.\n\nI bring a strong background in building reliable systems and collaborating across teams. I am eager to learn about this opportunity and discuss how my skills align with your needs.\n\nBest regards,\n${applicant.personal.firstName} ${applicant.personal.lastName}`;
       }
     } else {
       // Text-like inputs
-      if (hint.match(/first.?name/i)) { action = "type"; value = applicant.firstName; }
-      else if (hint.match(/last.?name|surname|family.?name/i)) { action = "type"; value = applicant.lastName; }
-      else if (hint.match(/full.?name/i)) { action = "type"; value = `${applicant.firstName} ${applicant.lastName}`; }
-      else if (hint.match(/email/i) || f.type === "email") { action = "type"; value = applicant.email; }
-      else if (hint.match(/phone|mobile|cell/i) || f.type === "tel") { action = "type"; value = applicant.phone; }
-      else if (hint.match(/city|location|address/i)) { action = "type"; value = applicant.location; }
-      else if (hint.match(/linkedin/i)) { action = "type"; value = applicant.linkedIn ?? ""; }
-      else if (hint.match(/portfolio|website|github|url/i)) { action = "type"; value = applicant.portfolio ?? applicant.linkedIn ?? ""; }
-      else if (hint.match(/year|experience/i)) { action = "type"; value = applicant.yearsExperience ?? "5"; }
+      if (hint.match(/first.?name/i)) { action = "type"; value = applicant.personal.firstName ?? ""; }
+      else if (hint.match(/last.?name|surname|family.?name/i)) { action = "type"; value = applicant.personal.lastName ?? ""; }
+      else if (hint.match(/full.?name/i)) { action = "type"; value = `${applicant.personal.firstName} ${applicant.personal.lastName}`; }
+      else if (hint.match(/email/i) || f.type === "email") { action = "type"; value = applicant.personal.email ?? ""; }
+      else if (hint.match(/phone|mobile|cell/i) || f.type === "tel") { action = "type"; value = applicant.personal.phone ?? ""; }
+      else if (hint.match(/city|location|address/i)) { action = "type"; value = applicant.personal.location ?? ""; }
+      else if (hint.match(/linkedin/i)) { action = "type"; value = applicant.links.linkedin ?? ""; }
+      else if (hint.match(/portfolio|website|github|url/i)) { action = "type"; value = applicant.links.portfolio ?? applicant.links.linkedin ?? ""; }
+      else if (hint.match(/year.*experience/i)) { action = "type"; value = applicant.yearsExperience ?? "5"; }
       else if (hint.match(/salary|compensation|pay/i)) { action = "type"; value = "Open to discussion based on total compensation"; }
       else if (hint.match(/start.?date|available|earliest/i)) { action = "type"; value = "Within 2 weeks"; }
       else if (hint.match(/source|how.*hear|referr/i)) { action = "type"; value = "Company website"; }

@@ -8,6 +8,12 @@ import { createAuthRouter } from "./routes/auth.js";
 import { authRequired } from "./auth/jwt.js";
 import { createDlqRouter } from "./routes/dlq.js";
 import { createInternalWorkerRouter } from "./routes/internalWorker.js";
+import { createJobRouter } from "./routes/job.js";
+import { createOnboardingRouter } from "./routes/onboarding.js";
+import { createProfileRouter } from "./routes/profile.js";
+import { createResumeRouter } from "./routes/resume.js";
+import { createApplicationGenRouter } from "./routes/applicationGen.js";
+import { createQueueRouter } from "./routes/queue.js";
 
 // Screenshots are written here by the worker process
 const PREVIEWS_ROOT = path.resolve(
@@ -45,7 +51,13 @@ export function createApp(): express.Express {
   app.use("/api/auth", createAuthRouter());
   app.use("/api/internal/worker", createInternalWorkerRouter());
   app.use("/api/applications", authRequired, createApplicationRouter());
+  app.use("/api/application", authRequired, createApplicationGenRouter());
   app.use("/api/dlq", authRequired, createDlqRouter());
+  app.use("/api/job", authRequired, createJobRouter());
+  app.use("/api/onboarding", authRequired, createOnboardingRouter());
+  app.use("/api/profile", authRequired, createProfileRouter());
+  app.use("/api/resume", authRequired, createResumeRouter());
+  app.use("/api/queue", createQueueRouter());
 
   // Serve worker screenshots so the Electron renderer can display them via HTTP
   // The worker stores screenshots in runtime/automation-previews/<appId>/<file>.png

@@ -74,8 +74,70 @@ export async function getMe(): Promise<{
 }
 
 // ──────────────────────────────────────────────
-// User Profile (stored locally for now)
+// User Profile (backend authoritative, local cache)
 // ──────────────────────────────────────────────
+
+export type EducationEntry = {
+  school: string;
+  major: string;
+  degree: string;
+  gpa: string;
+  startMonth: string;
+  startYear: string;
+  endMonth: string;
+  endYear: string;
+};
+
+export type ExperienceEntry = {
+  title: string;
+  company: string;
+  location: string;
+  type: string;
+  startMonth: string;
+  startYear: string;
+  endMonth: string;
+  endYear: string;
+  current: boolean;
+  description: string;
+};
+
+export type RolePreferences = {
+  desiredRoles: string[];
+  preferredLocations: string[];
+  employmentTypes: string[];
+};
+
+export type WorkAuthorization = {
+  usAuthorized: "yes" | "no" | "";
+  canadaAuthorized: "yes" | "no" | "";
+  ukAuthorized: "yes" | "no" | "";
+  needsVisaSponsorship: "yes" | "no" | "";
+};
+
+export type EeoProfile = {
+  ethnicities: string[];
+  declineEthnicity: boolean;
+  disability: "yes" | "no" | "decline" | "";
+  veteran: "yes" | "no" | "decline" | "";
+  lgbtq: "yes" | "no" | "decline" | "";
+  gender: "male" | "female" | "non-binary" | "decline" | "";
+};
+
+export type SkillEntry = {
+  name: string;
+  preferred?: boolean;
+};
+
+export type PersonalProfile = {
+  dateOfBirth?: string;
+};
+
+export type LinkProfile = {
+  linkedin: string;
+  github: string;
+  portfolio: string;
+  other: string;
+};
 
 export type UserProfile = {
   firstName: string;
@@ -88,6 +150,15 @@ export type UserProfile = {
   portfolio?: string;
   yearsExperience?: string;
   whyCompany?: string;
+  roles?: RolePreferences;
+  education?: EducationEntry[];
+  experience?: ExperienceEntry[];
+  workAuth?: WorkAuthorization;
+  eeo?: EeoProfile;
+  skills?: SkillEntry[];
+  personal?: PersonalProfile;
+  links?: LinkProfile;
+  answers?: Record<string, string>; // Unified answers for the form filler
 };
 
 const PROFILE_KEY = "autoapply_profile";
@@ -104,6 +175,32 @@ export function getStoredProfile(): UserProfile | null {
 
 export function saveProfile(profile: UserProfile): void {
   localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+}
+
+export async function getProfile(): Promise<UserProfile> {
+  const res = await api.get("/api/profile");
+  return res.data as UserProfile;
+}
+
+export async function putProfile(profile: UserProfile): Promise<UserProfile> {
+  const res = await api.put("/api/profile", profile);
+  return res.data as UserProfile;
+}
+
+export async function uploadProfileResume(payload: { resumeText?: string; file?: File }): Promise<{ resumeText: string }> {
+  if (payload.file) {
+    const form = new FormData();
+    form.append("file", payload.file);
+    const res = await api.post("/api/profile/resume", form, {
+      headers: {
+        "Content-Type": "multipart/form-data"
+      }
+    });
+    return res.data as { resumeText: string };
+  }
+
+  const res = await api.post("/api/profile/resume", { resumeText: payload.resumeText ?? "" });
+  return res.data as { resumeText: string };
 }
 
 // ──────────────────────────────────────────────
@@ -164,4 +261,91 @@ export function subscribeToApplication(
   return () => {
     socket.off("application:update", listener);
   };
+}
+
+// ──────────────────────────────────────────────
+// Onboarding Chat
+// ──────────────────────────────────────────────
+
+export type OnboardingMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+export type OnboardingResponse = {
+  message: string;
+  field: string;
+  section: string;
+  action: "confirm" | "ask" | "update" | "skip" | "complete";
+  progress: number;
+  data: Record<string, unknown>;
+};
+
+export type OnboardingProfile = {
+  education: Array<{
+    institution: string | null;
+    field_of_study: string | null;
+    degree: string | null;
+    gpa: number | null;
+    startMonth: number | null;
+    startYear: number | null;
+    endMonth: number | null;
+    endYear: number | null;
+  }>;
+  experience: Array<{
+    job_title: string | null;
+    company: string | null;
+    location: string | null;
+    employment_type: string | null;
+    startMonth: number | null;
+    startYear: number | null;
+    endMonth: number | null;
+    endYear: number | null;
+    current: boolean;
+    description: string | null;
+  }>;
+  workAuth: Record<string, string>;
+  eeo: Record<string, string>;
+  skills: string[];
+  personal: {
+    phone: string;
+    location: string;
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+  };
+  links: {
+    linkedin: string;
+    github: string;
+    portfolio: string;
+  };
+};
+
+const ONBOARDING_PROFILE_KEY = "autoapply_onboarding_profile";
+
+export function getStoredOnboardingProfile(): OnboardingProfile | null {
+  try {
+    const raw = localStorage.getItem(ONBOARDING_PROFILE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as OnboardingProfile;
+  } catch {
+    return null;
+  }
+}
+
+export function saveOnboardingProfile(profile: OnboardingProfile): void {
+  localStorage.setItem(ONBOARDING_PROFILE_KEY, JSON.stringify(profile));
+}
+
+export async function extractFullProfile(resumeText: string): Promise<OnboardingProfile> {
+  const res = await api.post("/api/onboarding/extract-full", { resumeText });
+  return res.data as OnboardingProfile;
+}
+
+export async function sendOnboardingMessage(
+  messages: OnboardingMessage[],
+  resumeText?: string
+): Promise<OnboardingResponse> {
+  const res = await api.post("/api/onboarding/chat", { messages, resumeText });
+  return res.data as OnboardingResponse;
 }

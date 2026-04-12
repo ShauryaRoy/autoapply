@@ -61,6 +61,21 @@ model User {
 
   credentials      IntegrationCredential[]
   deadLetterJobs   DeadLetterJob[]
+  profile          UserProfile?
+}
+
+model UserProfile {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  education  Json     @default("[]")
+  experience Json     @default("[]")
+  skills     Json     @default("[]")
+  projects   Json     @default("{}")
+  resumeText String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model IntegrationCredential {
@@ -94,4 +109,16 @@ model DeadLetterJob {
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([queueName, status, createdAt])
+}
+
+model QueueJob {
+  id        String   @id
+  userId    String?  
+  jobUrl    String? 
+  status    String   @default("PENDING")
+  steps     Json     @default("{}")
+  result    Json     @default("{}")
+  errors    Json     @default("[]")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

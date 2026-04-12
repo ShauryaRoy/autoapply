@@ -8,3 +8,7 @@ interface Window {
 }
 
 declare module "*.css";
+declare module "*?url" {
+	const value: string;
+	export default value;
+}
