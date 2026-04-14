@@ -26,10 +26,8 @@ import {
   extractKeywords,
   matchCvToJd,
   analyzeGhostRisk,
-  computeOverallScore,
   buildTldr,
   buildAnalysisSummary,
-  type RemotePolicy,
 } from "../services/jobIntelligenceService.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -171,21 +169,13 @@ export function createJobRouter(): Router {
         repostCount: input.ghostRiskHints.repostCount ?? 0,
       });
 
-      // ── 6. Overall Score (0-5 internal) ───────────────────
-      const overallScore = computeOverallScore({
-        cvMatchScore: cvMatch.matchScoreEstimate,
-        ghostRisk,
-        remotePolicy,
-        preferredRemotePolicies: input.preferredRemotePolicies as RemotePolicy[],
-      });
-
-      // ── 7. Decision layer — normalise + decide ─────────────
+      // ── 6. Decision layer — deterministic normalized formula ─
       const analysis = buildAnalysisSummary({
-        overallScore,
         cvMatch,
         ghostRisk,
         keywords,
         profileText: input.profileText,
+        jdText: jd,
         remotePolicy,
         seniority,
         jdSkillCount: jdSkills.all.length,

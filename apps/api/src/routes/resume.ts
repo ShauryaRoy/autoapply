@@ -14,6 +14,7 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
 import { patchResume } from "../services/resumePatchService.js";
+import { parseResumeWithAI } from "../services/resumeAiParserService.js";
 import { env } from "../config/env.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -46,12 +47,47 @@ const ResumePatchSchema = z.object({
 
 type ResumePatchRequest = z.infer<typeof ResumePatchSchema>;
 
+const ResumeAiParseSchema = z.object({
+  text: z.string().min(1, "text is required"),
+  jobId: z.string().optional(),
+  model: z.string().optional()
+});
+
 // ─────────────────────────────────────────────────────────────
 // Route factory
 // ─────────────────────────────────────────────────────────────
 
 export function createResumeRouter(): Router {
   const router = Router();
+
+  router.post("/parse-ai", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const parsed = ResumeAiParseSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({
+          message: "Invalid request body",
+          errors: parsed.error.flatten().fieldErrors
+        });
+        return;
+      }
+
+      const input = parsed.data;
+
+      const parsedResume = await parseResumeWithAI(input.text, {
+        geminiApiKey: env.geminiApiKey,
+        geminiModel: input.model
+      });
+
+      if (!parsedResume || !("projects" in parsedResume)) {
+        res.json({ parsedResume: null, fallback: true });
+        return;
+      }
+
+      res.json({ parsedResume, fallback: false });
+    } catch (error) {
+      next(error);
+    }
+  });
 
   /**
    * POST /api/resume/patch

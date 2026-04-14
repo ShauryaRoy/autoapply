@@ -135,6 +135,10 @@ function confidence(score: number | null, missingSkillsCount: number): Confidenc
   return { level: "Low", label: "RISKY", tone: "danger" };
 }
 
+function formatTokenForDisplay(token: string): string {
+  return token.replaceAll("_", " ");
+}
+
 function getFailedStep(timeline: Array<{ label: string; status: "pending" | "running" | "completed" | "failed" }>): string {
   const failed = timeline.find((step) => step.status === "failed");
   return failed?.label ?? "Unknown step";
@@ -500,14 +504,14 @@ export function JobDetail({ jobId, jobTitle, company, onBack }: JobDetailProps) 
               <div>
                 <p className="mb-2 text-sm text-slate-500">Matched skills</p>
                 <div className="flex flex-wrap gap-2">
-                  {matchedSkills.length ? matchedSkills.map((skill) => <Badge key={skill} tone="success">{skill}</Badge>) : <p className="text-sm text-slate-500">No matched skills yet.</p>}
+                  {matchedSkills.length ? matchedSkills.map((skill) => <Badge key={skill} tone="success">{formatTokenForDisplay(skill)}</Badge>) : <p className="text-sm text-slate-500">No matched skills yet.</p>}
                 </div>
               </div>
 
               <div>
                 <p className="mb-2 text-sm text-slate-500">Missing skills</p>
                 <div className="flex flex-wrap gap-2">
-                  {missingSkills.length ? missingSkills.map((skill) => <Badge key={skill} tone="warning">{skill}</Badge>) : <p className="text-sm text-slate-500">No missing skills reported.</p>}
+                  {missingSkills.length ? missingSkills.map((skill) => <Badge key={skill} tone="warning">{formatTokenForDisplay(skill)}</Badge>) : <p className="text-sm text-slate-500">No missing skills reported.</p>}
                 </div>
               </div>
 

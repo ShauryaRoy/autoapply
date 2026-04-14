@@ -14,6 +14,7 @@ import { createProfileRouter } from "./routes/profile.js";
 import { createResumeRouter } from "./routes/resume.js";
 import { createApplicationGenRouter } from "./routes/applicationGen.js";
 import { createQueueRouter } from "./routes/queue.js";
+import { createLiveApplyRouter } from "./routes/liveApply.js";
 
 // Screenshots are written here by the worker process
 const PREVIEWS_ROOT = path.resolve(
@@ -58,6 +59,7 @@ export function createApp(): express.Express {
   app.use("/api/profile", authRequired, createProfileRouter());
   app.use("/api/resume", authRequired, createResumeRouter());
   app.use("/api/queue", createQueueRouter());
+  app.use("/api/live-apply", authRequired, createLiveApplyRouter());
 
   // Serve worker screenshots so the Electron renderer can display them via HTTP
   // The worker stores screenshots in runtime/automation-previews/<appId>/<file>.png

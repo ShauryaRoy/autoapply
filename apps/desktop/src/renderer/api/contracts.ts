@@ -92,6 +92,7 @@ export interface AnalyzeJobResponse {
   };
   analysis: {
     score: number;
+    confidence?: "LOW" | "MEDIUM" | "HIGH";
     decision: "APPLY" | "RISKY" | "SKIP";
     apply_priority: "HIGH" | "MEDIUM" | "LOW";
     matched_skills: string[];
@@ -99,6 +100,19 @@ export interface AnalyzeJobResponse {
     risk_flags: string[];
     match_score: number;
     score_breakdown: Record<string, number>;
+    score_breakdown_verbose?: {
+      skill_match: { value: number; impact: "LOW" | "MEDIUM" | "HIGH" };
+      keyword_overlap: { value: number; impact: "LOW" | "MEDIUM" | "HIGH" };
+      experience_match: { value: number; impact: "LOW" | "MEDIUM" | "HIGH" };
+      risk_score: { value: number; impact: "NEGATIVE" };
+    };
+    reasons?: {
+      missing_skills: string[];
+      experience_gap: string | null;
+      keyword_mismatch: string[];
+      risk_summary: Array<{ type: string; message: string }>;
+      risk_summary_text?: string[];
+    };
   };
   details: {
     roleSummary: Record<string, unknown>;

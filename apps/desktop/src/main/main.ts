@@ -12,7 +12,8 @@ function createWindow(): void {
     minWidth: 1200,
     minHeight: 760,
     webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.js")
+      preload: path.join(__dirname, "../preload/preload.js"),
+      webviewTag: true
     }
   });
 

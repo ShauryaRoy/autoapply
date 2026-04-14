@@ -2,6 +2,8 @@ import type { Page } from "playwright";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { buildResumeCanonical } from "../automation/tailor/resumeTailor.js";
+import { type ResumeCanonical } from "../automation/tailor/types.js";
 
 // ─────────────────────────────────────────────────────
 // Types
@@ -62,9 +64,17 @@ interface ApplicantData {
     github?: string | null;
   };
   resumeText: string;
+  resumeCanonical?: ResumeCanonical;
   yearsExperience?: string;
   coverLetter?: string;
   answers?: Record<string, string>;
+}
+
+function getResumeTextForContext(applicant: ApplicantData): string {
+  if (applicant.resumeCanonical) {
+    return applicant.resumeCanonical.rawText;
+  }
+  return applicant.resumeText;
 }
 
 // ─────────────────────────────────────────────────────
@@ -352,7 +362,7 @@ ${experienceBlock}
 ${answersBlock}
 
 RESUME TEXT (FOR CONTEXT ONLY):
-${applicant.resumeText.slice(0, 3000)}
+${getResumeTextForContext(applicant).slice(0, 3000)}
 
 FORM FIELDS FOUND ON PAGE:
 ${fieldDescriptions}
@@ -576,15 +586,112 @@ async function executeFillInstructions(
 }
 
 // ─────────────────────────────────────────────────────
-// Save resume text as a plain text file for upload
+// Save resume text as a PDF file for upload
 // ─────────────────────────────────────────────────────
+
+function escapePdfText(value: string): string {
+  return value
+    .replace(/[^\x20-\x7E]/g, " ")
+    .replace(/\\/g, "\\\\")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
+}
+
+function wrapResumeLines(text: string, maxChars = 95): string[] {
+  const rawLines = text.split(/\r?\n/);
+  const wrapped: string[] = [];
+
+  for (const line of rawLines) {
+    const normalized = line.trimEnd();
+    if (!normalized) {
+      wrapped.push("");
+      continue;
+    }
+
+    let cursor = normalized;
+    while (cursor.length > maxChars) {
+      wrapped.push(cursor.slice(0, maxChars));
+      cursor = cursor.slice(maxChars);
+    }
+    wrapped.push(cursor);
+  }
+
+  return wrapped;
+}
+
+function buildResumePdfBuffer(resumeText: string): Buffer {
+  const lines = wrapResumeLines(resumeText).slice(0, 60);
+  const lineCommands = lines
+    .map((line, index) => {
+      const y = 760 - (index * 12);
+      return `1 0 0 1 50 ${y} Tm (${escapePdfText(line || " ")}) Tj`;
+    })
+    .join("\n");
+
+  const stream = `BT\n/F1 10 Tf\n${lineCommands}\nET`;
+  const streamLength = Buffer.byteLength(stream, "utf8");
+
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+    "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    `5 0 obj\n<< /Length ${streamLength} >>\nstream\n${stream}\nendstream\nendobj\n`
+  ];
+
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [];
+
+  for (const objectText of objects) {
+    offsets.push(Buffer.byteLength(pdf, "utf8"));
+    pdf += objectText;
+  }
+
+  const xrefOffset = Buffer.byteLength(pdf, "utf8");
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (const offset of offsets) {
+    pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+
+  return Buffer.from(pdf, "utf8");
+}
 
 async function prepareResumeFile(resumeText: string, applicationId: string): Promise<string> {
   const dir = path.resolve(process.cwd(), "runtime", "resumes", applicationId);
   await fs.mkdir(dir, { recursive: true });
-  const filePath = path.join(dir, "resume.txt");
-  await fs.writeFile(filePath, resumeText, "utf-8");
+  const filePath = path.join(dir, "resume.pdf");
+  const pdfBuffer = buildResumePdfBuffer(resumeText);
+  await fs.writeFile(filePath, pdfBuffer);
   return filePath;
+}
+
+async function prepareCanonicalResumeFile(
+  applicant: ApplicantData,
+  applicationId: string,
+  log: (msg: string) => Promise<void>
+): Promise<string> {
+  const resumeCanonical = applicant.resumeCanonical;
+
+  if (!resumeCanonical) {
+    throw new Error("Missing canonical resume — aborting application");
+  }
+
+  const computed = buildResumeCanonical(resumeCanonical);
+
+  if (computed !== resumeCanonical.rawText) {
+    throw new Error("Canonical mismatch — blocking submission");
+  }
+
+  try {
+    const filePath = await prepareResumeFile(resumeCanonical.rawText, applicationId);
+    await log(`Prepared resume for upload (Canonical)`);
+    return filePath;
+  } catch (error) {
+    await log(`Resume preparation failed (${error instanceof Error ? error.message : "unknown error"})`);
+    throw error;
+  }
 }
 
 // ─────────────────────────────────────────────────────
@@ -656,14 +763,7 @@ export async function intelligentlyFillPage(
 
   // Prepare resume file in case we need to upload it
   let resumePath: string | undefined;
-  if (applicant.resumeText) {
-    try {
-      resumePath = await prepareResumeFile(applicant.resumeText, Date.now().toString());
-      await log("Resume file prepared for upload");
-    } catch {
-      await log("Could not prepare resume file — upload may fail");
-    }
-  }
+  resumePath = await prepareCanonicalResumeFile(applicant, Date.now().toString(), log);
 
   for (let pageNum = 0; pageNum < maxPages; pageNum++) {
     pagesProcessed++;

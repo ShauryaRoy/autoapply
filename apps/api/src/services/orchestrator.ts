@@ -4,7 +4,7 @@ import { addAutomationJob } from "../queue/applicationQueue.js";
 import { 
   detectArchetype, detectSeniority, detectRemotePolicy, 
   extractSkills, extractKeywords, matchCvToJd, 
-  analyzeGhostRisk, computeOverallScore, buildAnalysisSummary 
+  analyzeGhostRisk, buildAnalysisSummary 
 } from "./jobIntelligenceService.js";
 import { patchResume } from "./resumePatchService.js";
 import { generateApplicationAnswers } from "./applicationService.js";
@@ -65,11 +65,16 @@ export async function processApplicationJob(job: Job<AppQueuePayload>): Promise<
         const cvMatch = matchCvToJd(skills, job.data.resume?.skills || [], JSON.stringify(job.data.resume));
         const ghostRisk = analyzeGhostRisk({ jdText, jobTitle: "Role", companyName: "Company" });
         const remotePolicy = detectRemotePolicy(jdText);
-        const overallScore = computeOverallScore({ cvMatchScore: cvMatch.matchScoreEstimate, ghostRisk, remotePolicy });
         
         return buildAnalysisSummary({
-          overallScore, cvMatch, ghostRisk, remotePolicy, seniority: detectSeniority(jdText),
-          jdSkillCount: skills.all.length, keywords, profileText: JSON.stringify(job.data.resume)
+          cvMatch,
+          ghostRisk,
+          remotePolicy,
+          seniority: detectSeniority(jdText),
+          jdSkillCount: skills.all.length,
+          keywords,
+          profileText: JSON.stringify(job.data.resume),
+          jdText,
         });
       })(), 30000, "analyze", state);
 

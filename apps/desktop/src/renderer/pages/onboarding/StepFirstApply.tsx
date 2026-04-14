@@ -18,6 +18,10 @@ function decisionTone(decision: "APPLY" | "SKIP" | "RISKY"): "success" | "danger
   return "danger";
 }
 
+function formatTokenForDisplay(token: string): string {
+  return token.replaceAll("_", " ");
+}
+
 export function StepFirstApply({ store, onSkip }: StepFirstApplyProps) {
   const analysis = store.job.analysis;
   const preview = useMemo(() => getOnboardingPreview({ job: store.job }), [store.job]);
@@ -66,10 +70,14 @@ export function StepFirstApply({ store, onSkip }: StepFirstApplyProps) {
             <CardContent className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-xs text-slate-500">Score</p>
+                  <p className="text-xs text-slate-500">Apply Score</p>
                   <p className="mt-1 text-2xl font-semibold text-slate-900">{Math.round(analysis.analysis.score)}%</p>
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <p className="text-xs text-slate-500">Profile Fit</p>
+                  <p className="mt-1 text-xl font-semibold text-slate-900">{Math.round(analysis.analysis.match_score)}%</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 col-span-2">
                   <p className="text-xs text-slate-500">Decision</p>
                   <Badge tone={decisionTone(analysis.analysis.decision)} className="mt-2">
                     {analysis.analysis.decision}
@@ -83,7 +91,7 @@ export function StepFirstApply({ store, onSkip }: StepFirstApplyProps) {
                   {analysis.analysis.matched_skills.length ? (
                     analysis.analysis.matched_skills.map((skill) => (
                       <Badge key={skill} tone="success">
-                        {skill}
+                        {formatTokenForDisplay(skill)}
                       </Badge>
                     ))
                   ) : (

@@ -5,14 +5,24 @@ import { Card, CardContent, CardHeader, CardTitle } from "../../../components/ui
 import { Input } from "../../../components/ui/input.js";
 import { ROLE_SUGGESTIONS } from "../data.js";
 
+type ApplyMode = "assist" | "smart_auto" | "full_auto";
+
 type JobInputPanelProps = {
   jobUrl: string;
   targetRole: string;
+  applyMode: ApplyMode;
+  autoSubmit: boolean;
+  pauseOnLowConfidence: boolean;
+  pauseOnLongAnswers: boolean;
   loading: boolean;
   hasApplication: boolean;
   error: string;
   onJobUrlChange: (value: string) => void;
   onTargetRoleChange: (value: string) => void;
+  onApplyModeChange: (value: ApplyMode) => void;
+  onAutoSubmitChange: (value: boolean) => void;
+  onPauseOnLowConfidenceChange: (value: boolean) => void;
+  onPauseOnLongAnswersChange: (value: boolean) => void;
   onSubmit: () => void;
 };
 
@@ -29,11 +39,19 @@ function isLikelyUrl(value: string): boolean {
 export function JobInputPanel({
   jobUrl,
   targetRole,
+  applyMode,
+  autoSubmit,
+  pauseOnLowConfidence,
+  pauseOnLongAnswers,
   loading,
   hasApplication,
   error,
   onJobUrlChange,
   onTargetRoleChange,
+  onApplyModeChange,
+  onAutoSubmitChange,
+  onPauseOnLowConfidenceChange,
+  onPauseOnLongAnswersChange,
   onSubmit
 }: JobInputPanelProps) {
   const isUrlValid = isLikelyUrl(jobUrl);
@@ -78,6 +96,83 @@ export function JobInputPanel({
               <option key={role} value={role} />
             ))}
           </datalist>
+        </div>
+
+        <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Execution Mode</p>
+
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="radio"
+              name="apply-mode"
+              checked={applyMode === "assist"}
+              onChange={() => onApplyModeChange("assist")}
+              disabled={loading || hasApplication}
+            />
+            Assist
+          </label>
+
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="radio"
+              name="apply-mode"
+              checked={applyMode === "smart_auto"}
+              onChange={() => onApplyModeChange("smart_auto")}
+              disabled={loading || hasApplication}
+            />
+            Smart Auto
+          </label>
+
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="radio"
+              name="apply-mode"
+              checked={applyMode === "full_auto"}
+              onChange={() => onApplyModeChange("full_auto")}
+              disabled={loading || hasApplication}
+            />
+            Full Auto
+          </label>
+
+          <div className="space-y-2 border-t border-slate-200 pt-2">
+            <label className="flex items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                checked={autoSubmit}
+                onChange={(event) => onAutoSubmitChange(event.target.checked)}
+                disabled={loading || hasApplication}
+              />
+              Auto submit after fill
+            </label>
+
+            <label className="flex items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                checked={pauseOnLowConfidence}
+                onChange={(event) => onPauseOnLowConfidenceChange(event.target.checked)}
+                disabled={loading || hasApplication}
+              />
+              Pause on low confidence
+            </label>
+
+            <label className="flex items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                checked={pauseOnLongAnswers}
+                onChange={(event) => onPauseOnLongAnswersChange(event.target.checked)}
+                disabled={loading || hasApplication}
+              />
+              Pause on long answers
+            </label>
+          </div>
+
+          <p className="text-[11px] text-slate-500">
+            {applyMode === "assist"
+              ? "Assist mode keeps full review UI before fill."
+              : applyMode === "smart_auto"
+                ? "Smart Auto runs silently until a safety fallback requires review."
+                : "Full Auto minimizes review interruptions and relies on safety stops + logs."}
+          </p>
         </div>
 
         {error ? <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p> : null}

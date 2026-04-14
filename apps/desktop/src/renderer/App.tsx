@@ -61,6 +61,32 @@ type AppData = {
   events: EventLog[];
 };
 
+type ResumeDiffLine = {
+  type: "added" | "removed" | "unchanged";
+  text: string;
+  reason?: string;
+};
+
+type ResumeOptimizationSnapshot = {
+  before: string;
+  canonical: string;
+  injectedSkills: string[];
+  keywordCandidates: string[];
+  tailoringTriggered: boolean;
+  fallbackUsed: boolean;
+  tailoringError?: string;
+  threshold: number;
+  scoreBefore?: number;
+  scoreAfter?: number;
+  version: number;
+  generatedFor: string;
+  generatedAt: string;
+  skillMatchBefore?: number;
+  skillMatchAfter?: number;
+  keywordOverlapBefore?: number;
+  keywordOverlapAfter?: number;
+};
+
 type AuthUser = { id: string; email: string; firstName: string; lastName: string };
 type Screen = "auth" | "profile" | "profileView" | "apply";
 type ProfileSectionKey = "resume" | "roles" | "education" | "experience" | "workAuth" | "eeo" | "skills" | "personal" | "links";
@@ -87,6 +113,19 @@ const MONTH_OPTIONS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December"
 ];
+
+const RESUME_PDF_DATA_URL_KEY = "autoapply_resume_pdf_data_url";
+const RESUME_PDF_NAME_KEY = "autoapply_resume_pdf_name";
+const RESUME_OPTIMIZATION_SNAPSHOT_KEY = "autoapply_resume_optimization_snapshot";
+
+type StoredResumePdf = {
+  dataUrl: string;
+  fileName: string;
+};
+
+type StoredResumeDiff = {
+  snapshot: ResumeOptimizationSnapshot;
+};
 
 // ──────────────────────────────────────────────
 // Helpers
@@ -261,6 +300,209 @@ function trimString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length ? trimmed : null;
+}
+
+function getStoredResumePdf(): StoredResumePdf | null {
+  try {
+    const dataUrl = localStorage.getItem(RESUME_PDF_DATA_URL_KEY);
+    const fileName = localStorage.getItem(RESUME_PDF_NAME_KEY);
+    if (!dataUrl || !fileName) return null;
+    return { dataUrl, fileName };
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredResumePdf(fileName: string, dataUrl: string): void {
+  try {
+    localStorage.setItem(RESUME_PDF_DATA_URL_KEY, dataUrl);
+    localStorage.setItem(RESUME_PDF_NAME_KEY, fileName);
+  } catch {
+    // Ignore localStorage write failures.
+  }
+}
+
+function getStoredResumeDiff(): StoredResumeDiff | null {
+  try {
+    const raw = localStorage.getItem(RESUME_OPTIMIZATION_SNAPSHOT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ResumeOptimizationSnapshot;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.before !== "string" || typeof parsed.canonical !== "string") return null;
+    return { snapshot: parsed };
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredResumeDiff(diff: ResumeOptimizationSnapshot): void {
+  try {
+    localStorage.setItem(RESUME_OPTIMIZATION_SNAPSHOT_KEY, JSON.stringify(diff));
+  } catch {
+    // Ignore localStorage write failures.
+  }
+}
+
+function resolveAddedLineReason(line: string, snapshot: ResumeOptimizationSnapshot): string | undefined {
+  const normalized = line.toLowerCase();
+  if (!normalized.trim()) return undefined;
+
+  const missingMatch = snapshot.injectedSkills.find((skill) => normalized.includes(skill.toLowerCase()));
+  if (missingMatch) return "added (missing skill)";
+
+  const keywordMatch = snapshot.keywordCandidates.find((keyword) => normalized.includes(keyword.toLowerCase()));
+  if (keywordMatch) return "added (keyword match)";
+
+  return "added (tailoring)";
+}
+
+function buildResumeLineDiff(beforeText: string, canonicalText: string, snapshot?: ResumeOptimizationSnapshot): ResumeDiffLine[] {
+  const before = beforeText.split(/\r?\n/);
+  const canonical = canonicalText.split(/\r?\n/);
+
+  const n = before.length;
+  const m = canonical.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array.from({ length: m + 1 }, () => 0));
+
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      if (before[i] === canonical[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const lines: ResumeDiffLine[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < n && j < m) {
+    if (before[i] === canonical[j]) {
+      lines.push({ type: "unchanged", text: before[i] });
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    if (dp[i + 1][j] >= dp[i][j + 1]) {
+      lines.push({ type: "removed", text: before[i] });
+      i += 1;
+    } else {
+      lines.push({
+        type: "added",
+        text: canonical[j],
+        reason: snapshot ? resolveAddedLineReason(canonical[j], snapshot) : undefined
+      });
+      j += 1;
+    }
+  }
+
+  while (i < n) {
+    lines.push({ type: "removed", text: before[i] });
+    i += 1;
+  }
+
+  while (j < m) {
+    lines.push({
+      type: "added",
+      text: canonical[j],
+      reason: snapshot ? resolveAddedLineReason(canonical[j], snapshot) : undefined
+    });
+    j += 1;
+  }
+
+  return lines;
+}
+
+function extractResumeDiffFromEvents(events: EventLog[]): ResumeOptimizationSnapshot | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.step !== "resume_optimized") continue;
+    const payload = event.payloadJson ?? {};
+    const before = typeof payload.resumeBefore === "string" ? payload.resumeBefore : "";
+    const canonical = typeof payload.resumeCanonical === "string" ? payload.resumeCanonical : "";
+    if (!before || !canonical) continue;
+
+    const rawInjected = payload.missingSkillsInjected;
+    const injectedSkills = Array.isArray(rawInjected)
+      ? rawInjected.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+
+    const rawKeywords = payload.keywordCandidates;
+    const keywordCandidates = Array.isArray(rawKeywords)
+      ? rawKeywords.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+
+    const tailoringError = typeof payload.tailoringError === "string"
+      ? payload.tailoringError
+      : typeof payload.error === "string"
+        ? payload.error
+        : undefined;
+    const tailoringTriggered = Boolean(payload.tailoringTriggered);
+    const fallbackUsed = Boolean(payload.fallbackUsed || tailoringError);
+    const threshold = typeof payload.threshold === "number"
+      ? payload.threshold
+      : typeof payload.tailoringThreshold === "number"
+        ? payload.tailoringThreshold
+        : 70;
+
+    const scoreBeforeRaw = typeof payload.scoreBefore === "number" ? payload.scoreBefore : undefined;
+    const scoreAfterRaw = typeof payload.scoreAfter === "number" ? payload.scoreAfter : undefined;
+    const scoreBefore = typeof scoreBeforeRaw === "number" ? (scoreBeforeRaw <= 1 ? Math.round(scoreBeforeRaw * 100) : Math.round(scoreBeforeRaw)) : undefined;
+    const scoreAfter = typeof scoreAfterRaw === "number" ? (scoreAfterRaw <= 1 ? Math.round(scoreAfterRaw * 100) : Math.round(scoreAfterRaw)) : undefined;
+
+    const skillMatchBefore = typeof payload.skillMatchBefore === "number" ? Math.round(payload.skillMatchBefore) : scoreBefore;
+    const skillMatchAfter = typeof payload.skillMatchAfter === "number" ? Math.round(payload.skillMatchAfter) : scoreAfter;
+    const keywordOverlapBefore = typeof payload.keywordOverlapBefore === "number" ? Math.round(payload.keywordOverlapBefore) : undefined;
+    const keywordOverlapAfter = typeof payload.keywordOverlapAfter === "number" ? Math.round(payload.keywordOverlapAfter) : undefined;
+
+    const version = typeof payload.version === "number"
+      ? payload.version
+      : typeof payload.resumeVersion === "number"
+        ? payload.resumeVersion
+        : 0;
+    const generatedFor = typeof payload.generatedFor === "string" ? payload.generatedFor : "unknown";
+    const generatedAt = typeof payload.generatedAt === "string" ? payload.generatedAt : new Date(event.createdAt).toISOString();
+
+    return {
+      before,
+      canonical,
+      injectedSkills,
+      keywordCandidates,
+      tailoringTriggered,
+      fallbackUsed,
+      tailoringError,
+      threshold,
+      scoreBefore,
+      scoreAfter,
+      version,
+      generatedFor,
+      generatedAt,
+      skillMatchBefore,
+      skillMatchAfter,
+      keywordOverlapBefore,
+      keywordOverlapAfter
+    };
+  }
+
+  return null;
+}
+
+async function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Could not read uploaded PDF."));
+      }
+    };
+    reader.onerror = () => reject(new Error("Could not read uploaded PDF."));
+    reader.readAsDataURL(file);
+  });
 }
 
 function isGarbage(value: unknown): boolean {
@@ -734,10 +976,40 @@ async function extractResumePdfText(file: File): Promise<string> {
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const content = await page.getTextContent();
-    const lines = content.items
-      .map((item) => ((item as { str?: string }).str ?? "").trim())
-      .filter((item) => !!item);
-    pages.push(lines.join(" "));
+    const items = content.items
+      .map((item) => {
+        const token = item as { str?: string; transform?: number[] };
+        return {
+          text: (token.str ?? "").trim(),
+          y: token.transform?.[5] ?? 0,
+          x: token.transform?.[4] ?? 0
+        };
+      })
+      .filter((item) => item.text.length > 0)
+      .sort((a, b) => {
+        if (Math.abs(b.y - a.y) > 2) {
+          return b.y - a.y;
+        }
+        return a.x - b.x;
+      });
+
+    const groupedLines: Array<{ y: number; parts: string[] }> = [];
+    items.forEach((item) => {
+      const existing = groupedLines.find((line) => Math.abs(line.y - item.y) <= 2);
+      if (existing) {
+        existing.parts.push(item.text);
+        return;
+      }
+
+      groupedLines.push({ y: item.y, parts: [item.text] });
+    });
+
+    const reconstructedLines = groupedLines
+      .sort((a, b) => b.y - a.y)
+      .map((line) => line.parts.join(" ").replace(/\s+/g, " ").trim())
+      .filter((line) => line.length > 0);
+
+    pages.push(reconstructedLines.join("\n"));
   }
 
   return pages.join("\n").trim();
@@ -1019,6 +1291,12 @@ function ProfileScreen({
   const [sectionWarning, setSectionWarning] = useState("");
   const [resumeUploadStatus, setResumeUploadStatus] = useState<"idle" | "uploading" | "success" | "error">("idle");
   const [resumeUploadMessage, setResumeUploadMessage] = useState("");
+  const [uploadedResumePdf, setUploadedResumePdf] = useState<StoredResumePdf | null>(() => getStoredResumePdf());
+  const storedResumeDiff = useMemo(() => getStoredResumeDiff()?.snapshot ?? null, [profile.resumeText]);
+  const storedResumeDiffLines = useMemo(() => {
+    if (!storedResumeDiff) return [];
+    return buildResumeLineDiff(storedResumeDiff.before, storedResumeDiff.canonical, storedResumeDiff);
+  }, [storedResumeDiff]);
 
   const set = (field: keyof UserProfile) => (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     setSaved(false);
@@ -1247,6 +1525,10 @@ function ProfileScreen({
     setResumeUploadMessage("Extracting text from your resume...");
 
     try {
+      const uploadedDataUrl = await readFileAsDataUrl(file);
+      saveStoredResumePdf(file.name, uploadedDataUrl);
+      setUploadedResumePdf({ fileName: file.name, dataUrl: uploadedDataUrl });
+
       const resumeText = await extractResumePdfText(file);
       if (!resumeText) {
         throw new Error("No readable text found in this PDF.");
@@ -1468,6 +1750,45 @@ function ProfileScreen({
               {resumeUploadStatus === "uploading" && <p className="resume-upload-status">{resumeUploadMessage}</p>}
               {resumeUploadStatus === "success" && <p className="resume-upload-status success">{resumeUploadMessage}</p>}
               {resumeUploadStatus === "error" && <p className="resume-upload-status error">{resumeUploadMessage}</p>}
+            </div>
+
+            <div className="field" style={{ marginTop: 14 }}>
+              <label>Uploaded Resume (PDF)</label>
+              {uploadedResumePdf ? (
+                <>
+                  <button
+                    type="button"
+                    className="save-btn"
+                    onClick={() => window.open(uploadedResumePdf.dataUrl, "_blank", "noopener,noreferrer")}
+                  >
+                    Resume PDF uploaded: {uploadedResumePdf.fileName}
+                  </button>
+                  <small className="mini-hint">Click to open your uploaded resume PDF.</small>
+                </>
+              ) : (
+                <small className="mini-hint">No PDF resume uploaded yet.</small>
+              )}
+            </div>
+
+            <div className="field" style={{ marginTop: 14 }}>
+              <label>Optimized Resume Changes</label>
+              {storedResumeDiff ? (
+                <>
+                  {storedResumeDiff.injectedSkills.length > 0 && (
+                    <small className="mini-hint">Injected missing skills: {storedResumeDiff.injectedSkills.join(", ")}</small>
+                  )}
+                  <div className="resume-diff-view" style={{ maxHeight: 260, marginTop: 8 }}>
+                    {storedResumeDiffLines.map((line, index) => (
+                      <div key={`profile-diff-${line.type}-${index}`} className={`resume-diff-line ${line.type}`}>
+                        <span className="resume-diff-prefix">{line.type === "added" ? "+" : line.type === "removed" ? "-" : " "}</span>
+                        <span>{line.text || " "}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <small className="mini-hint">No optimization diff yet. Run an application to see resume changes.</small>
+              )}
             </div>
           </div>
         )}
@@ -1896,6 +2217,12 @@ function ProfileOverviewScreen({
   const skills = (profile.skills ?? []).map((skill) => skill.name).filter(Boolean);
   const roles = profile.roles?.desiredRoles ?? [];
   const links = profile.links ?? EMPTY_LINKS;
+  const uploadedResumePdf = useMemo(() => getStoredResumePdf(), [profile.resumeText]);
+  const storedResumeDiff = useMemo(() => getStoredResumeDiff()?.snapshot ?? null, [profile.resumeText]);
+  const storedResumeDiffLines = useMemo(() => {
+    if (!storedResumeDiff) return [];
+    return buildResumeLineDiff(storedResumeDiff.before, storedResumeDiff.canonical, storedResumeDiff);
+  }, [storedResumeDiff]);
 
   return (
     <DashboardLayout
@@ -1932,6 +2259,41 @@ function ProfileOverviewScreen({
               <div className="field"><label>Location</label><input value={profile.location} disabled readOnly /></div>
               <div className="field"><label>Date of Birth</label><input value={profile.personal?.dateOfBirth ?? ""} disabled readOnly /></div>
             </div>
+          </div>
+
+          <div className="profile-card">
+            <h2>Resume</h2>
+            {uploadedResumePdf ? (
+              <>
+                <p className="section-hint">Uploaded resume type: PDF</p>
+                <button
+                  className="save-btn"
+                  type="button"
+                  onClick={() => window.open(uploadedResumePdf.dataUrl, "_blank", "noopener,noreferrer")}
+                >
+                  Open uploaded resume: {uploadedResumePdf.fileName}
+                </button>
+              </>
+            ) : (
+              <p className="section-hint">No resume uploaded yet.</p>
+            )}
+
+            {storedResumeDiff ? (
+              <>
+                <p className="section-hint" style={{ marginTop: 10 }}>Latest optimized resume diff</p>
+                {storedResumeDiff.injectedSkills.length > 0 && (
+                  <p className="section-hint">Injected missing skills: {storedResumeDiff.injectedSkills.join(", ")}</p>
+                )}
+                <div className="resume-diff-view" style={{ maxHeight: 260 }}>
+                  {storedResumeDiffLines.map((line, index) => (
+                    <div key={`overview-diff-${line.type}-${index}`} className={`resume-diff-line ${line.type}`}>
+                      <span className="resume-diff-prefix">{line.type === "added" ? "+" : line.type === "removed" ? "-" : " "}</span>
+                      <span>{line.text || " "}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
           </div>
 
           <div className="profile-card">
@@ -2381,6 +2743,46 @@ function ApplyScreen({
   // Prefer live-polled URL (refreshed every 2s), fall back to last event's URL
   const latestPreview = livePreviewUrl || eventPreviewUrl;
 
+  const resumeDiffData = useMemo(() => {
+    return extractResumeDiffFromEvents(runData?.events ?? []);
+  }, [runData]);
+
+  const resumeDiffLines = useMemo(() => {
+    if (!resumeDiffData) return [];
+    return buildResumeLineDiff(resumeDiffData.before, resumeDiffData.canonical, resumeDiffData);
+  }, [resumeDiffData]);
+
+  const runSummary = useMemo(() => {
+    const initialScore = resumeDiffData?.scoreBefore;
+    const finalScore = resumeDiffData?.scoreAfter;
+    const missingSkillsInjected = resumeDiffData?.injectedSkills.length ?? 0;
+    const resumeTailored = Boolean(resumeDiffData?.tailoringTriggered && !resumeDiffData?.fallbackUsed);
+    return {
+      initialScore,
+      finalScore,
+      missingSkillsInjected,
+      resumeTailored,
+      status: runData?.status ?? "idle"
+    };
+  }, [resumeDiffData, runData]);
+
+  const impactMetrics = useMemo(() => {
+    const skillBefore = resumeDiffData?.skillMatchBefore;
+    const skillAfter = resumeDiffData?.skillMatchAfter;
+    const keywordBefore = resumeDiffData?.keywordOverlapBefore;
+    const keywordAfter = resumeDiffData?.keywordOverlapAfter;
+
+    return {
+      skillDelta: typeof skillBefore === "number" && typeof skillAfter === "number" ? skillAfter - skillBefore : null,
+      keywordDelta: typeof keywordBefore === "number" && typeof keywordAfter === "number" ? keywordAfter - keywordBefore : null
+    };
+  }, [resumeDiffData]);
+
+  useEffect(() => {
+    if (!resumeDiffData) return;
+    saveStoredResumeDiff(resumeDiffData);
+  }, [resumeDiffData]);
+
   const refresh = useCallback(async () => {
     if (!applicationId) return;
     try {
@@ -2535,6 +2937,50 @@ function ApplyScreen({
 
       {/* Main panel */}
       <main className="main-panel">
+        <section className="resume-diff-card">
+          <h2>Run Summary</h2>
+          <div className="status-grid">
+            <div>
+              <span>Initial Score</span>
+              <strong>{typeof runSummary.initialScore === "number" ? `${runSummary.initialScore}%` : "-"}</strong>
+            </div>
+            <div>
+              <span>Final Score</span>
+              <strong>{typeof runSummary.finalScore === "number" ? `${runSummary.finalScore}%` : "-"}</strong>
+            </div>
+            <div>
+              <span>Missing Skills Injected</span>
+              <strong>{runSummary.missingSkillsInjected}</strong>
+            </div>
+            <div>
+              <span>Resume Tailored</span>
+              <strong>{runSummary.resumeTailored ? "YES" : "NO"}</strong>
+            </div>
+            <div>
+              <span>Application Status</span>
+              <strong>{runSummary.status}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section className="resume-diff-card">
+          <h2>Tailoring Decision</h2>
+          <div className="status-grid">
+            <div>
+              <span>Score</span>
+              <strong>{typeof resumeDiffData?.scoreAfter === "number" ? `${resumeDiffData.scoreAfter}%` : "-"}</strong>
+            </div>
+            <div>
+              <span>Threshold</span>
+              <strong>{typeof resumeDiffData?.threshold === "number" ? `${resumeDiffData.threshold}%` : "-"}</strong>
+            </div>
+            <div>
+              <span>Triggered</span>
+              <strong>{resumeDiffData?.tailoringTriggered ? "YES" : "NO"}</strong>
+            </div>
+          </div>
+        </section>
+
         {/* Status bar */}
         <section className="status-card">
           <div className="status-header">
@@ -2587,6 +3033,77 @@ function ApplyScreen({
         </section>
 
         {/* Browser preview + logs */}
+        <section className="resume-diff-card">
+          <h2>Resume Used for Application</h2>
+          {resumeDiffData ? (
+            <>
+              <p className="section-hint">{resumeDiffData.fallbackUsed ? "⚠ Tailoring failed — original resume was used" : "✔ This version was submitted"}</p>
+
+              <div className="status-grid" style={{ marginBottom: 10 }}>
+                <div>
+                  <span>Score</span>
+                  <strong>{typeof resumeDiffData.scoreAfter === "number" ? `${resumeDiffData.scoreAfter}%` : "-"}</strong>
+                </div>
+                <div>
+                  <span>Threshold</span>
+                  <strong>{resumeDiffData.threshold}%</strong>
+                </div>
+                <div>
+                  <span>Triggered</span>
+                  <strong>{resumeDiffData.tailoringTriggered ? "YES" : "NO"}</strong>
+                </div>
+              </div>
+
+              <div className="status-grid" style={{ marginBottom: 10 }}>
+                <div>
+                  <span>Version</span>
+                  <strong>{resumeDiffData.version}</strong>
+                </div>
+                <div>
+                  <span>Generated For</span>
+                  <strong>{resumeDiffData.generatedFor}</strong>
+                </div>
+                <div>
+                  <span>Timestamp</span>
+                  <strong>{new Date(resumeDiffData.generatedAt).toLocaleString()}</strong>
+                </div>
+              </div>
+
+              <div className="status-grid" style={{ marginBottom: 10 }}>
+                <div>
+                  <span>Skill Match</span>
+                  <strong>{impactMetrics.skillDelta === null ? "-" : `${impactMetrics.skillDelta >= 0 ? "+" : ""}${impactMetrics.skillDelta}%`}</strong>
+                </div>
+                <div>
+                  <span>Keyword Overlap</span>
+                  <strong>{impactMetrics.keywordDelta === null ? "-" : `${impactMetrics.keywordDelta >= 0 ? "+" : ""}${impactMetrics.keywordDelta}%`}</strong>
+                </div>
+              </div>
+
+              <h3 style={{ margin: "8px 0 6px", fontSize: "0.9rem" }}>Final Resume Preview</h3>
+              <div className="resume-final-preview">{resumeDiffData.canonical}</div>
+
+              <h3 style={{ margin: "10px 0 6px", fontSize: "0.9rem" }}>Optimization Diff</h3>
+              <p className="section-hint">Green lines were added. Red lines were removed.</p>
+              {resumeDiffData.injectedSkills.length > 0 && (
+                <p className="section-hint">Injected missing skills: {resumeDiffData.injectedSkills.join(", ")}</p>
+              )}
+              <div className="resume-diff-view">
+                {resumeDiffLines.map((line, index) => (
+                  <div key={`${line.type}-${index}`} className={`resume-diff-line ${line.type}`}>
+                    <span className="resume-diff-prefix">{line.type === "added" ? "+" : line.type === "removed" ? "-" : " "}</span>
+                    <span>{line.text || " "}{line.type === "added" && line.reason ? `  -> ${line.reason}` : ""}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : runData?.currentStep === "resume_optimized" ? (
+            <p className="section-hint">Resume optimization is running. Changes will appear here once tailoring completes.</p>
+          ) : (
+            <p className="section-hint">No optimized resume diff yet. Start an application to see resume changes.</p>
+          )}
+        </section>
+
         <section className="log-card">
           <h2>Live Automation Preview</h2>
           <div className="preview-frame">

@@ -12,6 +12,8 @@
  *  - career-ops/liveness-core.mjs  (ghost/expired job detection)
  */
 
+import { getSkillMatchScore } from "@autoapply/shared";
+
 // ─────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────
@@ -356,16 +358,54 @@ export function matchCvToJd(
   profileText: string
 ): CvMatchResult {
   const profileLower = profileText.toLowerCase();
-  const profileSkillsLower = profileSkills.map((s) => s.toLowerCase());
+
+  const SKILL_NORMALIZATION: Record<string, string> = {
+    postgresql: "postgres",
+    sqlserver: "sql",
+    node: "nodejs",
+    machinelearning: "machine_learning",
+    deeplearning: "deep_learning",
+    "machine learning": "machine_learning",
+    "deep learning": "deep_learning"
+  };
+
+  const normalizeSkillToken = (value: string): string => {
+    const compact = value
+      .toLowerCase()
+      .replace(/[^a-z0-9_ ]+/g, " ")
+      .trim()
+      .replace(/\s+/g, " ");
+    if (!compact) return "";
+    const collapsed = compact.replace(/\s+/g, "");
+    const direct = SKILL_NORMALIZATION[compact] ?? SKILL_NORMALIZATION[collapsed] ?? compact;
+    return direct.replace(/\s+/g, "_");
+  };
+
+  const profileSkillsNormalized = profileSkills
+    .map((skill) => normalizeSkillToken(skill))
+    .filter(Boolean);
+
+  // Include text-derived skills to preserve existing lexical behavior while adding family semantics.
+  const textTermsNormalized = profileLower
+    .split(/[^a-z0-9_]+/)
+    .map((token) => normalizeSkillToken(token))
+    .filter(Boolean);
+
+  const userSkillPool = Array.from(new Set([...profileSkillsNormalized, ...textTermsNormalized]));
 
   const matchedSkills: ExtractedSkill[] = [];
   const gaps: CvGap[] = [];
 
+  let requiredScoreSum = 0;
+  let preferredScoreSum = 0;
+
   // Check required skills
   for (const skill of jdSkills.required) {
-    const inSkillList = profileSkillsLower.includes(skill.toLowerCase());
-    const inProfileText = profileLower.includes(skill.toLowerCase());
-    const matched = inSkillList || inProfileText;
+    const normalizedSkill = normalizeSkillToken(skill);
+    const matchScore = getSkillMatchScore(normalizedSkill, userSkillPool);
+    const matched = matchScore > 0;
+
+    requiredScoreSum += matchScore;
 
     matchedSkills.push({
       skill,
@@ -373,7 +413,7 @@ export function matchCvToJd(
       matchedInProfile: matched,
     });
 
-    if (!matched) {
+    if (matchScore === 0) {
       gaps.push({
         requirement: skill,
         severity: "hard-blocker",
@@ -384,9 +424,11 @@ export function matchCvToJd(
 
   // Check preferred skills
   for (const skill of jdSkills.preferred) {
-    const inSkillList = profileSkillsLower.includes(skill.toLowerCase());
-    const inProfileText = profileLower.includes(skill.toLowerCase());
-    const matched = inSkillList || inProfileText;
+    const normalizedSkill = normalizeSkillToken(skill);
+    const matchScore = getSkillMatchScore(normalizedSkill, userSkillPool);
+    const matched = matchScore > 0;
+
+    preferredScoreSum += matchScore;
 
     matchedSkills.push({
       skill,
@@ -394,7 +436,7 @@ export function matchCvToJd(
       matchedInProfile: matched,
     });
 
-    if (!matched) {
+    if (matchScore === 0) {
       gaps.push({
         requirement: skill,
         severity: "nice-to-have",
@@ -405,24 +447,18 @@ export function matchCvToJd(
 
   // Compute match score (0-5)
   const requiredTotal = jdSkills.required.length;
-  const requiredMatched = matchedSkills
-    .filter((s) => s.weight === "required" && s.matchedInProfile)
-    .length;
   const preferredTotal = jdSkills.preferred.length;
-  const preferredMatched = matchedSkills
-    .filter((s) => s.weight === "preferred" && s.matchedInProfile)
-    .length;
 
   let score = 0;
   if (requiredTotal > 0) {
     // Required skills account for 70% of the score
-    score += (requiredMatched / requiredTotal) * 3.5;
+    score += (requiredScoreSum / requiredTotal) * 3.5;
   } else {
     score += 3.5; // no required skills listed → favour
   }
   if (preferredTotal > 0) {
     // Preferred skills account for 30%
-    score += (preferredMatched / preferredTotal) * 1.5;
+    score += (preferredScoreSum / preferredTotal) * 1.5;
   } else {
     score += 1.5;
   }
@@ -725,12 +761,12 @@ export function extractRiskFlags(params: {
 // ─────────────────────────────────────────────────────────────
 
 export interface ScoreBreakdown {
-  /** % of JD skills found in profile (required + preferred) */
+  /** Normalized 0..1 of JD skills found in profile (required + preferred) */
   skill_match: number;
-  /** % of JD keywords found in profile text */
+  /** Normalized 0..1 of JD keywords found in profile text */
   keyword_overlap: number;
   /**
-   * Heuristic experience match:
+   * Normalized 0..1 heuristic experience match:
    * penalises if JD seniority exceeds Entry-Level and profileText is short / sparse.
    */
   experience_match: number;
@@ -749,12 +785,12 @@ export function computeScoreBreakdown(params: {
   const totalTracked = cvMatch.matchedSkills.length;
   const totalMatched = cvMatch.matchedSkills.filter((s) => s.matchedInProfile).length;
   const skill_match =
-    totalTracked > 0 ? Math.round((totalMatched / totalTracked) * 100) : 100;
+    totalTracked > 0 ? (totalMatched / totalTracked) : 1;
 
   // Keyword overlap — percentage of domain keywords found in profile text
   const keywordHits = keywords.filter((kw) => profileLower.includes(kw.toLowerCase())).length;
   const keyword_overlap =
-    keywords.length > 0 ? Math.round((keywordHits / keywords.length) * 100) : 100;
+    keywords.length > 0 ? (keywordHits / keywords.length) : 1;
 
   // Experience match — heuristic based on seniority & profile length
   const SENIORITY_WEIGHT: Record<Seniority, number> = {
@@ -771,9 +807,194 @@ export function computeScoreBreakdown(params: {
   // Assume a reasonable senior profile has 400+ words
   const profileDepth = Math.min(1, profileWords / 400);
   const seniorityFactor = SENIORITY_WEIGHT[seniority] ?? 0.8;
-  const experience_match = Math.round(profileDepth * seniorityFactor * 100);
+  const experience_match = Math.max(0, Math.min(1, profileDepth * seniorityFactor));
 
   return { skill_match, keyword_overlap, experience_match };
+}
+
+export interface AnalysisReasons {
+  missing_skills: string[];
+  experience_gap: string | null;
+  keyword_mismatch: string[];
+  risk_summary: Array<{ type: string; message: string }>;
+  risk_summary_text: string[];
+}
+
+export type TailoredResume = {
+  summary: string;
+  skills: string[];
+  experience: {
+    title: string;
+    bullets: string[];
+  }[];
+  keywordsInjected: string[];
+};
+
+const IMPORTANT_KEYWORDS = [
+  "scalability",
+  "performance",
+  "distributed",
+  "microservices",
+  "observability"
+];
+
+const SOFT_WORDS = ["team", "communication", "collaboration", "leadership"];
+
+function formatTokenForDisplay(token: string): string {
+  return token.replaceAll("_", " ");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function countTermFrequencyInText(text: string, term: string): number {
+  if (!term.trim()) return 0;
+  const pattern = new RegExp(`\\b${escapeRegExp(term.toLowerCase())}\\b`, "gi");
+  return (text.match(pattern) ?? []).length;
+}
+
+function rankMissingSkills(cvMatch: CvMatchResult, jdText: string, maxItems = 5): string[] {
+  const jdLower = jdText.toLowerCase();
+  const missing = cvMatch.matchedSkills
+    .filter((skill) => !skill.matchedInProfile)
+    .map((skill) => ({
+      skill: skill.skill,
+      weight: skill.weight,
+      frequency: countTermFrequencyInText(jdLower, skill.skill),
+    }));
+
+  missing.sort((a, b) => {
+    const weightA = a.weight === "required" ? 2 : a.weight === "preferred" ? 1 : 0;
+    const weightB = b.weight === "required" ? 2 : b.weight === "preferred" ? 1 : 0;
+    if (weightA !== weightB) return weightB - weightA;
+    if (a.frequency !== b.frequency) return b.frequency - a.frequency;
+    return a.skill.localeCompare(b.skill);
+  });
+
+  return missing.slice(0, maxItems).map((item) => item.skill);
+}
+
+function toRiskType(signal: LegitimacySignal): string {
+  const normalizedSignal = signal.signal.toLowerCase();
+  const normalizedFinding = signal.finding.toLowerCase();
+
+  if (normalizedSignal.includes("posting freshness") && (normalizedFinding.includes("aging") || normalizedFinding.includes("old"))) {
+    return "STALE_POST";
+  }
+  if (normalizedSignal.includes("expired")) return "EXPIRED_POST";
+  if (normalizedSignal.includes("reposting")) return "REPOSTED";
+  if (normalizedSignal.includes("apply button") && normalizedFinding.includes("missing")) return "NO_APPLY_BUTTON";
+  if (normalizedSignal.includes("technology specificity")) return "VAGUE_JD";
+  if (normalizedSignal.includes("requirements realism")) return "UNREALISTIC_REQUIREMENTS";
+  if (normalizedSignal.includes("salary")) return "SALARY_UNCLEAR";
+  return signal.signal.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+}
+
+function computeConfidence(params: { jdTermCount: number; skillTermsCount: number; riskScore: number }): "LOW" | "MEDIUM" | "HIGH" {
+  const { jdTermCount, skillTermsCount, riskScore } = params;
+  const signalDensity = jdTermCount > 0 ? skillTermsCount / jdTermCount : 0;
+  if (jdTermCount < 15) return "LOW";
+  if (skillTermsCount < 3) return "LOW";
+  if (signalDensity < 0.1) return "LOW";
+  if (riskScore > 0.6) return "MEDIUM";
+  return "HIGH";
+}
+
+type ScoreImpact = "LOW" | "MEDIUM" | "HIGH";
+
+function getImpact(value: number): ScoreImpact {
+  if (value < 0.4) return "LOW";
+  if (value < 0.7) return "MEDIUM";
+  return "HIGH";
+}
+
+export interface ScoreBreakdownVerbose {
+  skill_match: { value: number; impact: ScoreImpact };
+  keyword_overlap: { value: number; impact: ScoreImpact };
+  experience_match: { value: number; impact: ScoreImpact };
+  risk_score: { value: number; impact: "NEGATIVE" };
+}
+
+function clampUnit(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function computeRiskScore(ghostRisk: GhostRiskResult): number {
+  const signalCount = ghostRisk.signals.length || 1;
+  const concerningCount = ghostRisk.signals.filter((signal) => signal.weight === "Concerning").length;
+  const concerningRatio = concerningCount / signalCount;
+
+  const tierBase =
+    ghostRisk.legitimacyTier === "Suspicious" ? 0.85 :
+    ghostRisk.legitimacyTier === "Proceed with Caution" ? 0.5 : 0.15;
+
+  return clampUnit((tierBase * 0.7) + (concerningRatio * 0.3));
+}
+
+function extractRequiredYears(jdText: string): number | null {
+  const matches = [...jdText.matchAll(/(\d+)\s*\+?\s*years?/gi)];
+  if (!matches.length) return null;
+  const years = matches.map((entry) => Number(entry[1])).filter((value) => Number.isFinite(value));
+  if (!years.length) return null;
+  return Math.max(...years);
+}
+
+function inferProfileYears(profileText: string): number {
+  const matches = [...profileText.matchAll(/(\d+)\s*\+?\s*years?/gi)];
+  const parsedYears = matches.map((entry) => Number(entry[1])).filter((value) => Number.isFinite(value));
+  if (parsedYears.length > 0) return Math.max(...parsedYears);
+
+  const words = profileText.split(/\s+/).filter(Boolean).length;
+  if (words >= 700) return 5;
+  if (words >= 400) return 3;
+  if (words >= 200) return 2;
+  return 1;
+}
+
+function buildAnalysisReasons(params: {
+  cvMatch: CvMatchResult;
+  keywords: string[];
+  profileText: string;
+  ghostRisk: GhostRiskResult;
+  jdText: string;
+}): AnalysisReasons {
+  const { cvMatch, keywords, profileText, ghostRisk, jdText } = params;
+  const profileLower = profileText.toLowerCase();
+  const jdLower = jdText.toLowerCase();
+
+  const missing_skills = rankMissingSkills(cvMatch, jdText, 5);
+
+  const requiredYears = extractRequiredYears(jdText);
+  const profileYears = inferProfileYears(profileText);
+  const experience_gap = requiredYears && profileYears < requiredYears
+    ? `Requires ${requiredYears}+ years, profile suggests ~${profileYears} year${profileYears === 1 ? "" : "s"}`
+    : null;
+
+  const keyword_mismatch = keywords
+    .filter((keyword) => {
+      const normalized = keyword.toLowerCase();
+      const frequency = countTermFrequencyInText(jdLower, normalized);
+      const important = IMPORTANT_KEYWORDS.includes(normalized);
+      const isSoft = SOFT_WORDS.includes(normalized);
+      return !isSoft && (frequency >= 2 || important) && !profileLower.includes(normalized);
+    })
+    .slice(0, 8);
+
+  const risk_summary = ghostRisk.signals
+    .filter((signal) => signal.weight !== "Positive")
+    .slice(0, 6)
+    .map((signal) => ({ type: toRiskType(signal), message: signal.finding }));
+
+  const risk_summary_text = risk_summary.map((item) => `${item.type}: ${item.message}`);
+
+  return {
+    missing_skills: missing_skills.map(formatTokenForDisplay),
+    experience_gap,
+    keyword_mismatch: keyword_mismatch.map(formatTokenForDisplay),
+    risk_summary,
+    risk_summary_text,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -783,51 +1004,97 @@ export function computeScoreBreakdown(params: {
 export interface JobAnalysisSummary {
   score: number;                // 0-100
   match_score: number;          // 0-100 (CV match only)
+  confidence: "LOW" | "MEDIUM" | "HIGH";
+  auto_apply_threshold: number;
+  tailoring_triggered: boolean;
+  tailoring_missing_skills: string[];
+  tailored_resume?: TailoredResume | null;
   decision: ApplyDecision;
   apply_priority: ApplyPriority;
   matched_skills: string[];
   missing_skills: string[];
   risk_flags: RiskFlag[];
   score_breakdown: ScoreBreakdown;
+  score_breakdown_verbose: ScoreBreakdownVerbose;
+  reasons: AnalysisReasons;
 }
+
+const AUTO_APPLY_THRESHOLD = Number(process.env.AUTO_APPLY_THRESHOLD ?? "70");
 
 /**
  * Build the flat analysis summary from all computed sub-results.
  * This is what the automated pipeline consumes.
  */
 export function buildAnalysisSummary(params: {
-  overallScore: number;       // 0-5 from computeOverallScore
   cvMatch: CvMatchResult;
   ghostRisk: GhostRiskResult;
   keywords: string[];
   profileText: string;
+  jdText: string;
   remotePolicy: RemotePolicy;
   seniority: Seniority;
   jdSkillCount: number;
 }): JobAnalysisSummary {
   const {
-    overallScore,
     cvMatch,
     ghostRisk,
     keywords,
     profileText,
+    jdText,
     remotePolicy,
     seniority,
     jdSkillCount,
   } = params;
 
-  const score = normalizeScore(overallScore);
   const match_score = normalizeScore(cvMatch.matchScoreEstimate);
+
+  const score_breakdown = computeScoreBreakdown({
+    cvMatch,
+    keywords,
+    profileText,
+    seniority,
+  });
+
+  const risk_score = computeRiskScore(ghostRisk);
+  const finalScore =
+    (0.4 * score_breakdown.skill_match) +
+    (0.25 * score_breakdown.keyword_overlap) +
+    (0.2 * score_breakdown.experience_match) +
+    (0.15 * (1 - risk_score));
+
+  const score_breakdown_verbose: ScoreBreakdownVerbose = {
+    skill_match: {
+      value: score_breakdown.skill_match,
+      impact: getImpact(score_breakdown.skill_match)
+    },
+    keyword_overlap: {
+      value: score_breakdown.keyword_overlap,
+      impact: getImpact(score_breakdown.keyword_overlap)
+    },
+    experience_match: {
+      value: score_breakdown.experience_match,
+      impact: getImpact(score_breakdown.experience_match)
+    },
+    risk_score: {
+      value: risk_score,
+      impact: "NEGATIVE"
+    }
+  };
+
+  const score = Math.round(clampUnit(finalScore) * 100);
+  const jdTermCount = new Set(jdText.toLowerCase().split(/[^a-z0-9_]+/).filter((term) => term.length >= 3)).size;
+  const skillTermsCount = jdSkillCount;
+  const confidence = computeConfidence({ jdTermCount, skillTermsCount, riskScore: risk_score });
   const decision = computeDecision(score);
   const apply_priority = computePriority(score);
+  const tailoring_triggered = score >= AUTO_APPLY_THRESHOLD;
 
   const matched_skills = cvMatch.matchedSkills
     .filter((s) => s.matchedInProfile)
     .map((s) => s.skill);
 
-  const missing_skills = cvMatch.matchedSkills
-    .filter((s) => !s.matchedInProfile)
-    .map((s) => s.skill);
+  const missing_skills = rankMissingSkills(cvMatch, jdText, 5);
+  const tailoring_missing_skills = missing_skills.map(formatTokenForDisplay).slice(0, 5);
 
   const risk_flags = extractRiskFlags({
     score,
@@ -838,21 +1105,29 @@ export function buildAnalysisSummary(params: {
     jdSkillCount,
   });
 
-  const score_breakdown = computeScoreBreakdown({
+  const reasons = buildAnalysisReasons({
     cvMatch,
     keywords,
     profileText,
-    seniority,
+    ghostRisk,
+    jdText,
   });
 
   return {
     score,
     match_score,
+    confidence,
+    auto_apply_threshold: AUTO_APPLY_THRESHOLD,
+    tailoring_triggered,
+    tailoring_missing_skills,
+    tailored_resume: null,
     decision,
     apply_priority,
     matched_skills,
     missing_skills,
     risk_flags,
     score_breakdown,
+    score_breakdown_verbose,
+    reasons,
   };
 }
