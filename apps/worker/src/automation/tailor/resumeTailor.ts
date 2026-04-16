@@ -1,9 +1,10 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { type TailorResumeInput, type ResumeCanonical } from "./types.js";
+import { type TailorResumeInput, type ResumeCanonical, type ResumeSectionEntry } from "./types.js";
 import { logger } from "../browser/logger.js";
 
-const LLM_TIMEOUT_MS = 5000;
+const LLM_TIMEOUT_MS = 30000; // 30 seconds for LLM API
 const MAX_TOTAL_INJECTIONS = 5;
+const MAX_PER_SECTION = 4;
 const KNOWN_SKILLS: string[] = [
   "JavaScript",
   "TypeScript",
@@ -65,16 +66,28 @@ function getPerSectionLimit(): number {
   return Math.floor(configured);
 }
 
-function inferSkillsFromResumeText(baseResume: string): string[] {
-  const lower = baseResume.toLowerCase();
+function extractRoleFromJobDescription(jobDescription: string): string {
+  const roleMatch = jobDescription.match(/role\s*:\s*(.+)/i);
+  if (roleMatch?.[1]) {
+    return roleMatch[1].trim();
+  }
+
+  const firstLine = jobDescription.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return firstLine ?? "Target Role";
+}
+
+function inferSkillsFromResumeText(originalResume: string): string[] {
+  const lower = originalResume.toLowerCase();
   return KNOWN_SKILLS.filter((skill) => lower.includes(skill.toLowerCase()));
 }
 
 function rewriteBulletWithKeywords(bullet: string, keywords: string[]): string {
   const cleanBullet = bullet.trim();
   if (!cleanBullet) return "";
+
   const selectedKeywords = keywords
-    .filter((entry) => entry.trim().length >= 3)
+    .map((keyword) => keyword.trim())
+    .filter((entry) => entry.length >= 3)
     .slice(0, 2);
 
   if (selectedKeywords.length === 0) return cleanBullet;
@@ -83,76 +96,313 @@ function rewriteBulletWithKeywords(bullet: string, keywords: string[]): string {
   const missingKeyword = selectedKeywords.find((kw) => !lower.includes(kw.toLowerCase()));
   if (!missingKeyword) return cleanBullet;
 
-  // Keep meaning intact by only adding contextual suffixes instead of replacing claims.
+  // Preserve claim fidelity while improving JD term alignment.
   return `${cleanBullet}, aligned with ${missingKeyword} requirements`;
 }
 
-function toExperienceBlocks(baseResume: string): ResumeCanonical["experience"] {
-  const lines = baseResume
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+// ── Section header detection ─────────────────────────────────────────────────
 
-  const candidates = lines.slice(1, 18);
-  const blocks: ResumeCanonical["experience"] = [];
-  for (let i = 0; i < candidates.length; i += 3) {
-    const chunk = candidates.slice(i, i + 3);
-    if (chunk.length === 0) continue;
-    const [titleLine, ...rest] = chunk;
-    const bullets = rest.length > 0 ? rest : ["Delivered measurable outcomes through cross-functional execution."];
-    blocks.push({
-      title: titleLine,
-      bullets: bullets.slice(0, 3)
-    });
-  }
+const SECTION_MAP: Record<string, string> = {
+  "summary": "summary",
+  "professional summary": "summary",
+  "career summary": "summary",
+  "profile": "summary",
+  "about": "summary",
+  "objective": "summary",
+  "career objective": "summary",
+  "experience": "experience",
+  "work experience": "experience",
+  "professional experience": "experience",
+  "employment": "experience",
+  "employment history": "experience",
+  "work history": "experience",
+  "career history": "experience",
+  "projects": "projects",
+  "project experience": "projects",
+  "personal projects": "projects",
+  "side projects": "projects",
+  "skills": "skills",
+  "technical skills": "skills",
+  "core skills": "skills",
+  "competencies": "skills",
+  "core competencies": "skills",
+  "technologies": "skills",
+  "tech stack": "skills",
+  "tools": "skills",
+  "education": "education",
+  "academic background": "education",
+  "qualifications": "education",
+  "activities": "activities",
+  "volunteer": "activities",
+  "volunteer experience": "activities",
+  "extracurricular": "activities",
+  "certifications": "activities",
+  "awards": "activities",
+  "achievements": "activities",
+  "honors": "activities",
+};
 
-  return blocks.slice(0, 5);
+function isSectionHeader(line: string): string | null {
+  const normalized = line
+    .replace(/[:\-|/\\]+$/, "")
+    .trim()
+    .toLowerCase();
+  // Must be relatively short to be a header, and not look like a bullet or sentence
+  if (normalized.length > 60) return null;
+  if (normalized.split(" ").length > 6) return null;
+  if (normalized.endsWith(".")) return null;
+  return SECTION_MAP[normalized] ?? null;
 }
 
-function extractOriginalSections(baseResume: string): Omit<ResumeCanonical, "rawText"> {
-  const lines = baseResume
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function isContactLine(line: string): boolean {
+  return (
+    /@/.test(line) ||
+    /\+?\d[\d\s().–\-]{6,}/.test(line) ||
+    /linkedin\.com|github\.com|portfolio/i.test(line) ||
+    /^https?:\/\//i.test(line) ||
+    /[a-z]{2,},\s+[a-z]{2,}/i.test(line) // city, state
+  );
+}
 
-  const summary = lines[0] ?? "Candidate summary not available.";
-  const lineExtractedSkills = lines
-    .filter((line) => /skill|javascript|typescript|react|python|node|sql|aws|java|docker|kubernetes|graphql|postgres|mongodb/i.test(line))
-    .slice(0, 10);
-  const inferredSkills = inferSkillsFromResumeText(baseResume);
-  const skills = dedupeSkills([...lineExtractedSkills, ...inferredSkills]).slice(0, 12);
-  const experience = toExperienceBlocks(baseResume);
+type ParsedSections = {
+  header: string[];
+  summary: string[];
+  experience: string[];
+  projects: string[];
+  skills: string[];
+  education: string[];
+  activities: string[];
+};
+
+function parseResumeSections(originalResume: string): ParsedSections {
+  const lines = originalResume.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const sections: ParsedSections = {
+    header: [],
+    summary: [],
+    experience: [],
+    projects: [],
+    skills: [],
+    education: [],
+    activities: [],
+  };
+
+  let currentSection: keyof ParsedSections = "header";
+  // First 5 lines treated as header unless a section header is detected
+  let headerDone = false;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const detectedSection = isSectionHeader(line);
+
+    if (detectedSection && detectedSection in sections) {
+      currentSection = detectedSection as keyof ParsedSections;
+      headerDone = true;
+      continue;
+    }
+
+    // If we're still in header and hit a non-contact line after 4 lines, auto-end header
+    if (!headerDone && i >= 4 && !isContactLine(line)) {
+      headerDone = true;
+      currentSection = "summary";
+    }
+
+    sections[currentSection].push(line);
+  }
+
+  return sections;
+}
+
+function parseExperienceEntries(lines: string[]): ResumeCanonical["experience"] {
+  const entries: ResumeCanonical["experience"] = [];
+  let currentTitle = "";
+  let currentBullets: string[] = [];
+
+  const flush = () => {
+    if (!currentTitle) return;
+    entries.push({
+      title: currentTitle,
+      bullets: currentBullets.filter((b) => b.trim().length > 0).slice(0, 5),
+    });
+    currentTitle = "";
+    currentBullets = [];
+  };
+
+  for (const line of lines) {
+    const isBullet =
+      /^[-•·*▪]/.test(line) ||
+      /^[a-z]/i.test(line) && line.length > 40;
+    const looksLikeTitle =
+      !isBullet &&
+      line.length > 3 &&
+      line.length < 100 &&
+      (
+        /[A-Z]/.test(line[0] ?? "") ||
+        /\d{4}/.test(line) ||
+        /at\s+|,|\|/.test(line)
+      );
+
+    if (looksLikeTitle && !currentTitle) {
+      currentTitle = line;
+    } else if (looksLikeTitle && currentBullets.length === 0 && currentTitle) {
+      // Could be a subtitle/company - append to title
+      currentTitle = `${currentTitle} | ${line}`;
+    } else if (looksLikeTitle && currentBullets.length > 0) {
+      // New entry
+      flush();
+      currentTitle = line;
+    } else {
+      const cleaned = line.replace(/^[-•·*▪]\s*/, "").trim();
+      if (cleaned.length > 5) {
+        currentBullets.push(cleaned);
+      }
+    }
+  }
+
+  flush();
+  return entries.slice(0, 8);
+}
+
+function extractSkillsFromSection(lines: string[]): string[] {
+  const skills: string[] = [];
+  for (const line of lines) {
+    // Handle comma/pipe/semicolon separated skills on one line
+    const parts = line
+      .split(/[,|;•·]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 1 && s.length < 40 && !isContactLine(s));
+    skills.push(...parts);
+  }
+  return skills;
+}
+
+function extractOriginalSections(originalResume: string): Omit<ResumeCanonical, "rawText"> {
+  const sections = parseResumeSections(originalResume);
+
+  // Summary: prefer dedicated summary section, else first non-contact header line
+  let summary = sections.summary.filter((l) => !isContactLine(l)).join(" ").trim();
+  if (!summary) {
+    // Try first 2 lines of experience as a last resort summary
+    summary = (sections.experience[0] ?? "Experienced professional delivering impactful results across cross-functional teams.");
+  }
+
+  // Skills: parse from the skills section, then fall back to inferred
+  const sectionSkills = extractSkillsFromSection(sections.skills);
+  const inferredSkills = inferSkillsFromResumeText(originalResume);
+  const skills = dedupeSkills([...sectionSkills, ...inferredSkills]).slice(0, 15);
+
+  // Experience: parse properly from the experience section
+  const experience =
+    sections.experience.length > 0
+      ? parseExperienceEntries(sections.experience)
+      : [];
+
+  // Projects
+  const projects =
+    sections.projects.length > 0
+      ? parseExperienceEntries(sections.projects)
+      : [];
+
+  // Activities (certifications, volunteer, etc.)
+  const activities =
+    sections.activities.length > 0
+      ? parseExperienceEntries(sections.activities)
+      : [];
+
+  const safeExperience =
+    experience.length > 0
+      ? experience
+      : [{ title: "Professional Experience", bullets: ["Delivered measurable outcomes through cross-functional execution."] }];
+
+  const safeSkills =
+    skills.length > 0
+      ? skills
+      : inferredSkills.length > 0
+        ? inferredSkills
+        : ["Communication", "Problem Solving", "Collaboration"];
+
+  const safeSummary = summary || "Experienced professional delivering high-quality results.";
 
   return {
-    summary,
-    skills,
-    experience,
-    keywordsInjected: []
+    summary: safeSummary,
+    skills: safeSkills,
+    experience: safeExperience,
+    projects,
+    activities,
+    keywordsInjected: [],
   };
 }
 
-export function buildResumeCanonical(structured: Omit<ResumeCanonical, "rawText">): string {
-  const summary = structured.summary.trim();
-  const skillsLine = structured.skills.join(", ");
-  const experienceLines = structured.experience
-    .flatMap((entry) => [entry.title, ...entry.bullets.map((bullet) => `- ${bullet}`)])
-    .join("\n");
+function sanitizeSectionEntries(
+  rawEntries: unknown,
+  fallbackEntries: ResumeSectionEntry[],
+  rewriteKeywords: string[],
+  perSectionLimit: number,
+  maxEntries: number
+): ResumeSectionEntry[] {
+  if (!Array.isArray(rawEntries)) {
+    return fallbackEntries.slice(0, maxEntries);
+  }
 
-  return [
-    summary,
-    "",
-    `Skills: ${skillsLine}`,
-    "",
-    "Experience:",
-    experienceLines,
-  ].join("\n").trim();
+  const entries = rawEntries
+    .filter((entry) => !!entry && typeof entry === "object")
+    .map((entry) => {
+      const title = ((entry as { title?: string }).title ?? "Section").toString().trim() || "Section";
+      const bullets = (((entry as { bullets?: string[] }).bullets) ?? [])
+        .map((bullet) => rewriteBulletWithKeywords(String(bullet), rewriteKeywords))
+        .filter((bullet) => bullet.trim().length > 0)
+        .slice(0, perSectionLimit);
+
+      return {
+        title,
+        bullets
+      } satisfies ResumeSectionEntry;
+    })
+    .filter((entry) => entry.bullets.length > 0);
+
+  if (entries.length === 0) {
+    return fallbackEntries.slice(0, maxEntries);
+  }
+
+  return entries.slice(0, maxEntries);
+}
+
+export function buildResumeCanonical(structured: Omit<ResumeCanonical, "rawText">): string {
+  const lines: string[] = [];
+
+  if (structured.summary.trim()) {
+    lines.push("Summary:", structured.summary.trim(), "");
+  }
+
+  const skillsLine = structured.skills.join(", ").trim();
+  if (skillsLine) {
+    lines.push(`Skills: ${skillsLine}`, "");
+  }
+
+  const appendSection = (label: string, entries: ResumeSectionEntry[]) => {
+    if (entries.length === 0) return;
+
+    lines.push(`${label}:`);
+    entries.forEach((entry) => {
+      lines.push(entry.title);
+      entry.bullets.forEach((bullet) => {
+        lines.push(`- ${bullet}`);
+      });
+    });
+    lines.push("");
+  };
+
+  appendSection("Experience", structured.experience);
+  appendSection("Projects", structured.projects);
+  appendSection("Activities", structured.activities);
+
+  return lines.join("\n").trim();
 }
 
 export function validateResumeCanonical(resumeCanonical: ResumeCanonical, allowedTerms?: string[]) {
   if (!resumeCanonical.summary.trim()) throw new Error("Empty summary section");
   if (resumeCanonical.skills.length === 0) throw new Error("Empty skills section");
   if (resumeCanonical.experience.length === 0) throw new Error("Empty experience section");
-  
+
   const skillCount = new Set(resumeCanonical.skills.map(normalizeToken)).size;
   if (skillCount !== resumeCanonical.skills.length) {
     throw new Error("Duplicate skills detected");
@@ -168,15 +418,25 @@ export function validateResumeCanonical(resumeCanonical: ResumeCanonical, allowe
   }
 }
 
+export function isTailored(canonical: ResumeCanonical, jd: string): boolean {
+  const lowerJd = jd.toLowerCase();
+  return canonical.skills.some((skill) => lowerJd.includes(skill.toLowerCase()));
+}
+
 function fallbackTailoredResume(input: TailorResumeInput): ResumeCanonical {
   const perSectionLimit = getPerSectionLimit();
-  const original = extractOriginalSections(input.baseResume);
-  const topSkills = dedupeSkills(input.jobProfile.skills.slice(0, 5));
-  const injected = topSkills.filter((skill) => !original.skills.some((s) => normalizeToken(s) === normalizeToken(skill)));
+  const original = extractOriginalSections(input.originalResume);
+  const role = extractRoleFromJobDescription(input.jobDescription);
+  const requiredSkills = dedupeSkills(input.requiredSkills).slice(0, 8);
+  const preferredSkills = dedupeSkills(input.preferredSkills).slice(0, 8);
+  const prioritizedSkills = dedupeSkills([...requiredSkills, ...preferredSkills]).slice(0, 12);
+  const rewriteKeywords = dedupeSkills([...requiredSkills, ...preferredSkills]).slice(0, 6);
+
+  const injected = prioritizedSkills.filter((skill) => !original.skills.some((s) => normalizeToken(s) === normalizeToken(skill)));
 
   const rewrittenExperience = original.experience.map((entry) => ({
     title: entry.title,
-    bullets: entry.bullets.map((bullet) => rewriteBulletWithKeywords(bullet, input.jobProfile.keywords)).slice(0, perSectionLimit)
+    bullets: entry.bullets.map((bullet) => rewriteBulletWithKeywords(bullet, rewriteKeywords)).slice(0, perSectionLimit)
   }));
 
   const fallbackExperience = rewrittenExperience.length > 0
@@ -186,33 +446,43 @@ function fallbackTailoredResume(input: TailorResumeInput): ResumeCanonical {
       bullets: ["Delivered production-ready software with cross-functional collaboration."]
     }];
 
-  const fallbackSkillCandidates = topSkills.length > 0
-    ? topSkills
-    : dedupeSkills(input.jobProfile.keywords.filter((keyword) => keyword.trim().length >= 3).slice(0, 5));
+  const summary = original.summary.toLowerCase().includes(role.toLowerCase())
+    ? original.summary
+    : `${original.summary} Targeted for ${role}.`;
 
-  const fallbackSkills = dedupeSkills([
-    ...fallbackSkillCandidates,
-    ...original.skills
-  ]);
-
-  const structured = {
-    summary: original.summary,
-    skills: fallbackSkills.length > 0 ? fallbackSkills : ["Software Development"],
+  const structured: Omit<ResumeCanonical, "rawText"> = {
+    summary,
+    skills: dedupeSkills([
+      ...prioritizedSkills,
+      ...original.skills
+    ]).slice(0, 12),
     experience: fallbackExperience,
+    projects: original.projects,
+    activities: original.activities,
     keywordsInjected: injected.slice(0, MAX_TOTAL_INJECTIONS)
   };
 
-  return {
+  const canonical: ResumeCanonical = {
     ...structured,
     rawText: buildResumeCanonical(structured)
   };
+
+  validateResumeCanonical(canonical, dedupeSkills([...requiredSkills, ...preferredSkills]));
+  if (!isTailored(canonical, input.jobDescription)) {
+    throw new Error("Canonical resume is not JD-optimized");
+  }
+
+  return canonical;
 }
 
 export async function tailorResume(input: TailorResumeInput): Promise<ResumeCanonical> {
   const perSectionLimit = getPerSectionLimit();
   const fallback = fallbackTailoredResume(input);
-  const original = extractOriginalSections(input.baseResume);
-  const topSkills = dedupeSkills(input.jobProfile.skills.slice(0, 5));
+  const original = extractOriginalSections(input.originalResume);
+  const requiredSkills = dedupeSkills(input.requiredSkills).slice(0, 8);
+  const preferredSkills = dedupeSkills(input.preferredSkills).slice(0, 8);
+  const role = extractRoleFromJobDescription(input.jobDescription);
+  const jdTerms = dedupeSkills([...requiredSkills, ...preferredSkills]);
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
@@ -223,17 +493,18 @@ export async function tailorResume(input: TailorResumeInput): Promise<ResumeCano
     const client = new GoogleGenerativeAI(apiKey);
     const model = client.getGenerativeModel({ model: process.env.GEMINI_MODEL ?? "gemini-1.5-flash" });
     const prompt = [
-      "Tailor a resume for a specific job.",
+      "Tailor a resume for a specific job description.",
       "Do not fabricate experience, employers, dates, or claims.",
       "Only rephrase and reorder existing information.",
-      "Rewrite each bullet semantically so it better aligns with JD language while preserving the original meaning.",
+      "Prioritize required skills over preferred skills.",
+      "Inject only legitimate JD keywords and maintain truthful bullet intent.",
       "Return valid JSON only with schema:",
-      '{"summary":"string","skills":["string"],"experience":[{"title":"string","bullets":["string"]}],"keywordsInjected":["string"]}',
-      `Target role: ${input.jobProfile.role}`,
-      `Target skills (prioritize top 5 only): ${topSkills.join(", ")}`,
-      `ATS keywords: ${input.jobProfile.keywords.join(", ")}`,
-      "Preserve original resume structure. Do not aggressively reorder entire sections.",
-      `Base resume:\n${input.baseResume.slice(0, 9000)}`
+      '{"summary":"string","skills":["string"],"experience":[{"title":"string","bullets":["string"]}],"projects":[{"title":"string","bullets":["string"]}],"activities":[{"title":"string","bullets":["string"]}],"keywordsInjected":["string"]}',
+      `Target role: ${role}`,
+      `Required skills: ${requiredSkills.join(", ")}`,
+      `Preferred skills: ${preferredSkills.join(", ")}`,
+      `Job description:\n${input.jobDescription.slice(0, 9000)}`,
+      `Original resume:\n${input.originalResume.slice(0, 9000)}`
     ].join("\n");
 
     const response = await withTimeout(model.generateContent(prompt), LLM_TIMEOUT_MS);
@@ -242,30 +513,50 @@ export async function tailorResume(input: TailorResumeInput): Promise<ResumeCano
     const parsed = JSON.parse(cleaned) as Partial<ResumeCanonical>;
 
     const candidateSkills = dedupeSkills((parsed.skills ?? []).filter(Boolean));
-    const safeSkillsBase = candidateSkills.length > 0 ? candidateSkills.slice(0, 8) : (topSkills.length > 0 ? topSkills : original.skills);
-    const safeSkills = dedupeSkills([...safeSkillsBase, ...topSkills]).slice(0, 12);
-    const safeSummary = parsed.summary?.trim() || original.summary;
+    const safeSkills = dedupeSkills([
+      ...requiredSkills,
+      ...candidateSkills,
+      ...preferredSkills,
+      ...original.skills
+    ]).slice(0, 12);
 
-    const parsedExperience = Array.isArray(parsed.experience) ? parsed.experience : [];
-    const safeExperience = parsedExperience
-      .filter((entry) => !!entry && typeof entry === "object")
-      .map((entry) => ({
-        title: ((entry as { title?: string }).title ?? "Experience").toString().trim() || "Experience",
-        bullets: (((entry as { bullets?: string[] }).bullets) ?? [])
-          .map((bullet) => rewriteBulletWithKeywords(String(bullet), input.jobProfile.keywords))
-          .filter((bullet) => bullet.trim().length > 0)
-          .slice(0, perSectionLimit)
-      }))
-      .filter((entry) => entry.bullets.length > 0);
+    const safeSummary = parsed.summary?.trim() || fallback.summary;
+    const rewriteKeywords = jdTerms.length > 0 ? jdTerms : fallback.skills;
+
+    const safeExperience = sanitizeSectionEntries(
+      parsed.experience,
+      fallback.experience,
+      rewriteKeywords,
+      perSectionLimit,
+      8
+    );
+
+    const safeProjects = sanitizeSectionEntries(
+      parsed.projects,
+      fallback.projects,
+      rewriteKeywords,
+      perSectionLimit,
+      6
+    );
+
+    const safeActivities = sanitizeSectionEntries(
+      parsed.activities,
+      fallback.activities,
+      rewriteKeywords,
+      perSectionLimit,
+      6
+    );
 
     const injectedFromModel = dedupeSkills((parsed.keywordsInjected ?? []).filter(Boolean));
-    const injectedFromTopSkills = topSkills.filter((skill) => !safeSkills.some((s) => normalizeToken(s) === normalizeToken(skill)));
-    const keywordsInjected = dedupeSkills([...injectedFromModel, ...injectedFromTopSkills]).slice(0, MAX_TOTAL_INJECTIONS);
+    const injectedFromRequired = requiredSkills.filter((skill) => !original.skills.some((s) => normalizeToken(s) === normalizeToken(skill)));
+    const keywordsInjected = dedupeSkills([...injectedFromModel, ...injectedFromRequired]).slice(0, MAX_TOTAL_INJECTIONS);
 
-    const structured = {
+    const structured: Omit<ResumeCanonical, "rawText"> = {
       summary: safeSummary,
-      skills: dedupeSkills([...safeSkills, ...keywordsInjected]),
-      experience: safeExperience.length > 0 ? safeExperience.slice(0, 8) : fallback.experience,
+      skills: dedupeSkills([...safeSkills, ...keywordsInjected]).slice(0, 12),
+      experience: safeExperience,
+      projects: safeProjects,
+      activities: safeActivities,
       keywordsInjected
     };
 
@@ -273,11 +564,22 @@ export async function tailorResume(input: TailorResumeInput): Promise<ResumeCano
       ...structured,
       rawText: buildResumeCanonical(structured)
     };
-    
-    validateResumeCanonical(canonical, input.jobProfile.keywords);
+
+    validateResumeCanonical(canonical, jdTerms);
+    if (!isTailored(canonical, input.jobDescription)) {
+      throw new Error("Canonical resume is not JD-optimized");
+    }
+
     return canonical;
-  } catch {
-    logger.warn("tailor.timeout", { stage: "resume_tailor" });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logger.warn("tailor.error", {
+      stage: "resume_tailor",
+      message: errorMsg,
+      stack: error instanceof Error ? error.stack : undefined,
+      timestamp: new Date().toISOString()
+    });
+    // Return fallback resume on any LLM or parsing error
     return fallback;
   }
 }
@@ -285,7 +587,7 @@ export async function tailorResume(input: TailorResumeInput): Promise<ResumeCano
 export function generatePDF(resumeCanonical: ResumeCanonical): string {
   const computed = buildResumeCanonical(resumeCanonical);
   if (computed !== resumeCanonical.rawText) {
-    throw new Error("Canonical mismatch — blocking PDF generation");
+    throw new Error("Canonical mismatch - blocking PDF generation");
   }
   return computed;
 }

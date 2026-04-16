@@ -68,11 +68,47 @@ interface ApplicantData {
   yearsExperience?: string;
   coverLetter?: string;
   answers?: Record<string, string>;
+  // Extended profile fields for comprehensive form filling
+  workAuth?: {
+    usAuthorized?: string;
+    canadaAuthorized?: string;
+    ukAuthorized?: string;
+    needsVisaSponsorship?: string;
+  };
+  salary?: {
+    expected?: string;
+    currency?: string;
+    openToNegotiation?: string;
+  };
+  availability?: {
+    noticePeriod?: string;
+    earliestStartDate?: string;
+    currentlyEmployed?: string;
+  };
+  workPreferences?: {
+    mode?: string;
+    willingToRelocate?: string;
+    travelPercent?: string;
+    inPersonPercent?: string;
+  };
+  roles?: {
+    desiredRoles?: string[];
+    preferredLocations?: string[];
+    employmentTypes?: string[];
+  };
+  eeo?: {
+    gender?: string;
+    veteran?: string;
+    disability?: string;
+    lgbtq?: string;
+    ethnicities?: string[];
+    declineEthnicity?: boolean;
+  };
 }
 
 function getResumeTextForContext(applicant: ApplicantData): string {
   if (applicant.resumeCanonical) {
-    return applicant.resumeCanonical.rawText;
+    return buildResumeCanonical(applicant.resumeCanonical);
   }
   return applicant.resumeText;
 }
@@ -228,6 +264,48 @@ async function extractFormFields(page: Page): Promise<FormField[]> {
        }
     });
 
+    // Special pass: ARIA-based custom dropdowns (React-Select, Workday, Greenhouse, etc.)
+    // These are NOT <select> elements — they use div/button with role="combobox"
+    const ariaComboboxes = utils.querySelectorAllDeep("[role='combobox'], [aria-haspopup='listbox']") as HTMLElement[];
+    ariaComboboxes.forEach((el) => {
+      // Skip if this is an <input> inside a native <select> wrapper, or already in our list
+      if (el.tagName.toLowerCase() === "select") return;
+      if (el.closest("select")) return;
+      if (!utils.isElementVisible(el)) return;
+      // Avoid duplicates from sibling inputs already captured
+      if (el.tagName.toLowerCase() === "input" && el.closest("[role='combobox']") && el.closest("[role='combobox']") !== el) return;
+
+      const labelText = utils.getLabel(el) || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "";
+      const currentVal = el.getAttribute("aria-activedescendant") ? el.textContent?.trim() || "" : (el as HTMLInputElement).value || "";
+
+      // Collect visible options already in DOM (some ATS pre-render them)
+      let options: string[] = [];
+      try {
+        const ariaControls = el.getAttribute("aria-controls");
+        const optionEls = ariaControls
+          ? document.querySelectorAll(`#${CSS.escape(ariaControls)} [role='option']`)
+          : el.querySelectorAll("[role='option']");
+        options = Array.from(optionEls).map(o => o.textContent?.trim() || "").filter(Boolean);
+      } catch { /* ignore — options will just be empty */ }
+
+      fields.push({
+        index: fieldIndex++,
+        tag: "custom-select",
+        type: "select",
+        name: el.getAttribute("name") || el.getAttribute("data-name") || "",
+        id: el.id || "",
+        placeholder: el.getAttribute("placeholder") || "",
+        label: labelText,
+        required: el.getAttribute("aria-required") === "true",
+        currentValue: currentVal,
+        ariaLabel: el.getAttribute("aria-label") || "",
+        dataTestId: el.getAttribute("data-testid") || "",
+        selector: utils.buildSelector(el, fieldIndex),
+        isVisible: true,
+        options: options.length ? options : undefined,
+      });
+    });
+
     return fields;
   });
 }
@@ -271,8 +349,29 @@ async function extractCheckboxesAndRadios(page: Page): Promise<FormField[]> {
     const elements = dom.querySelectorAllDeep("input[type='checkbox'], input[type='radio']") as HTMLInputElement[];
 
     elements.forEach((el, idx) => {
-      const parent = el.closest("label");
-      const labelText = parent?.textContent?.trim() ?? el.getAttribute("aria-label") ?? "";
+      // Walk up the DOM tree looking for a label: direct wrapping label, nearby sibling label, or aria-label
+      const wrappingLabel = el.closest("label");
+      let labelText = el.getAttribute("aria-label") ?? "";
+      if (!labelText && wrappingLabel) {
+        // Clone and remove the input itself so we only get the text portion of the label
+        const clone = wrappingLabel.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll("input").forEach(i => i.remove());
+        labelText = clone.textContent?.trim() ?? "";
+      }
+      if (!labelText && el.id) {
+        const associated = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (associated) labelText = associated.textContent?.trim() ?? "";
+      }
+
+      // Build a unique selector — for radio groups, include the value so each radio is distinct
+      let selector: string;
+      if (el.id) {
+        selector = `#${CSS.escape(el.id)}`;
+      } else if (el.name && el.value) {
+        selector = `input[name="${CSS.escape(el.name)}"][value="${CSS.escape(el.value)}"]`;
+      } else {
+        selector = `input[name="${CSS.escape(el.name)}"]`;
+      }
 
       fields.push({
         index: 1000 + idx,
@@ -281,12 +380,12 @@ async function extractCheckboxesAndRadios(page: Page): Promise<FormField[]> {
         name: el.name ?? "",
         id: el.id ?? "",
         placeholder: "",
-        label: labelText,
+        label: labelText || el.value || "",
         required: el.required,
-        currentValue: el.checked ? "checked" : "unchecked",
+        currentValue: el.checked ? el.value || "checked" : "unchecked",
         ariaLabel: el.getAttribute("aria-label") ?? "",
         dataTestId: el.getAttribute("data-testid") ?? "",
-        selector: el.id ? `#${CSS.escape(el.id)}` : `input[name="${CSS.escape(el.name)}"]`,
+        selector,
         isVisible: el.getBoundingClientRect().width > 0
       });
     });
@@ -340,48 +439,206 @@ async function askGeminiWhatToFill(
   const educationBlock = applicant.education.map(e => `- ${e.degree} in ${e.field_of_study} from ${e.institution} (${e.start_year}-${e.end_year ?? "Present"})`).join("\n");
   const experienceBlock = applicant.experience.map(e => `- ${e.job_title} at ${e.company} (${e.start_year}-${e.end_year ?? "Present"}): ${e.description?.slice(0, 200)}...`).join("\n");
 
-  const prompt = `You are an AI job application assistant. You are filling out a job application form.
+  // Build work authorization block
+  const workAuth = applicant.workAuth ?? {};
+  const workAuthBlock = [
+    `- Authorized to work in the US: ${workAuth.usAuthorized === "yes" ? "YES" : workAuth.usAuthorized === "no" ? "NO" : "not specified"}`,
+    `- Authorized to work in Canada: ${workAuth.canadaAuthorized === "yes" ? "YES" : workAuth.canadaAuthorized === "no" ? "NO" : "not specified"}`,
+    `- Authorized to work in the UK: ${workAuth.ukAuthorized === "yes" ? "YES" : workAuth.ukAuthorized === "no" ? "NO" : "not specified"}`,
+    `- Requires visa sponsorship: ${workAuth.needsVisaSponsorship === "yes" ? "YES" : workAuth.needsVisaSponsorship === "no" ? "NO" : "not specified"}`
+  ].join("\n");
+
+  // Build availability block
+  const avail = applicant.availability ?? {};
+  const noticePeriod = avail.noticePeriod || "2 weeks";
+  const startDate = avail.earliestStartDate || "Within 2 weeks";
+  const availBlock = [
+    `- Notice period: ${noticePeriod}`,
+    `- Earliest start date: ${startDate}`,
+    `- Currently employed: ${avail.currentlyEmployed === "yes" ? "YES" : avail.currentlyEmployed === "no" ? "NO" : "not specified"}`
+  ].join("\n");
+
+  // Build salary block
+  const sal = applicant.salary ?? {};
+  const expectedSalary = sal.expected ? `${sal.expected} ${sal.currency ?? "USD"}` : "Open to discussion";
+  const salaryBlock = [
+    `- Expected salary: ${expectedSalary}`,
+    `- Open to negotiation: ${sal.openToNegotiation === "no" ? "NO" : "YES"}`
+  ].join("\n");
+
+  // Build work preferences block
+  const prefs = applicant.workPreferences ?? {};
+  const inPersonPct = prefs.inPersonPercent || "25";
+  const travelPct = prefs.travelPercent || "25";
+  const workMode = prefs.mode || "flexible";
+  const relocate = prefs.willingToRelocate === "no" ? "NO" : "YES";
+  const prefsBlock = [
+    `- Preferred work mode: ${workMode} (remote/hybrid/onsite)`,
+    `- Willing to relocate: ${relocate}`,
+    `- Willing to travel up to: ${travelPct}% of the time`,
+    `- Comfortable with in-person: ${inPersonPct}% of the time`,
+    `- Preferred employment types: ${(applicant.roles?.employmentTypes ?? ["Full-time"]).join(", ")}`
+  ].join("\n");
+
+  // Build EEO block
+  const eeo = applicant.eeo ?? {};
+  const eeoBlock = [
+    eeo.gender ? `- Gender: ${eeo.gender}` : "",
+    eeo.veteran ? `- Veteran: ${eeo.veteran}` : "",
+    eeo.disability ? `- Disability: ${eeo.disability}` : "",
+    eeo.lgbtq ? `- LGBTQ+: ${eeo.lgbtq}` : "",
+    eeo.declineEthnicity ? `- Ethnicity: Decline to state` : (eeo.ethnicities?.length ? `- Ethnicity: ${eeo.ethnicities.join(", ")}` : "")
+  ].filter(Boolean).join("\n");
+
+  // Pre-compute resume context safely — a crash here must not block the fill
+  let resumeContext = applicant.resumeText.slice(0, 2500);
+  try {
+    resumeContext = getResumeTextForContext(applicant).slice(0, 2500);
+  } catch (err) {
+    console.warn("   ⚠ getResumeTextForContext failed, falling back to raw resumeText:", err instanceof Error ? err.message : err);
+  }
+
+  const prompt = `You are an AI job application assistant filling out a job application form on behalf of the applicant.
 
 PAGE: "${pageTitle}" (${pageUrl})
 
-APPLICANT PROFILE:
-- Name: ${applicant.personal.firstName} ${applicant.personal.lastName}
-- Email: ${applicant.personal.email}
-- Phone: ${applicant.personal.phone}
-- Location: ${applicant.personal.location}
-- Skills: ${applicant.skills.join(", ")}
-${applicant.links.linkedin ? `- LinkedIn: ${applicant.links.linkedin}` : ""}
-${applicant.links.portfolio ? `- Portfolio: ${applicant.links.portfolio}` : ""}
+═══ APPLICANT PROFILE ═══
+Name: ${applicant.personal.firstName} ${applicant.personal.lastName}
+Email: ${applicant.personal.email}
+Phone: ${applicant.personal.phone}
+Location: ${applicant.personal.location}
+Years of Experience: ${applicant.yearsExperience ?? applicant.experience.length ?? "3"}
+Skills: ${applicant.skills.join(", ")}
+${applicant.links.linkedin ? `LinkedIn: ${applicant.links.linkedin}` : ""}
+${applicant.links.github ? `GitHub: ${applicant.links.github}` : ""}
+${applicant.links.portfolio ? `Portfolio: ${applicant.links.portfolio}` : ""}
 
-EDUCATION:
+═══ WORK AUTHORIZATION ═══
+${workAuthBlock}
+
+═══ AVAILABILITY ═══
+${availBlock}
+
+═══ SALARY / COMPENSATION ═══
+${salaryBlock}
+
+═══ WORK PREFERENCES ═══
+${prefsBlock}
+
+${eeoBlock ? `═══ EEO / DEMOGRAPHICS ═══\n${eeoBlock}\n` : ""}
+
+═══ EDUCATION ═══
 ${educationBlock}
 
-EXPERIENCE:
+═══ WORK EXPERIENCE ═══
 ${experienceBlock}
 
 ${answersBlock}
 
-RESUME TEXT (FOR CONTEXT ONLY):
-${getResumeTextForContext(applicant).slice(0, 3000)}
+═══ RESUME TEXT (context only) ═══
+${resumeContext}
 
-FORM FIELDS FOUND ON PAGE:
+═══ FORM FIELDS ON THIS PAGE ═══
 ${fieldDescriptions}
 
-INSTRUCTIONS:
-For each field, decide what to fill. Return a JSON array of objects.
+═══ INSTRUCTIONS ═══
+Return a JSON array of fill instructions. Each entry has: index, selector, action, value.
 
-CRITICAL RULES:
-1. NEVER, EVER paste the entire resume text into a single field unless it's a specific "Paste your resume here" area.
-2. For Experience/Education fields: Use the structured data above. Provide concise summaries or specific titles/companies/dates as requested by the field label.
-3. If a field asks for "Experience" or "Work History" as a single textarea, summarize the top 3 roles concisely. DO NOT dump the whole resume.
-4. For text fields (School, Major, Title): Use MAXIMUM 80 characters.
-5. Fill ALL visible required fields.
-6. For name: use "${applicant.personal.firstName}" and "${applicant.personal.lastName}".
-7. For phone: use "${applicant.personal.phone}". Match country codes exactly in selects.
-8. For address/postal: Check SPECIFIC FORM ANSWERS first. If missing, use "${applicant.personal.location}" or realistic defaults for that city.
-9. For "cover letter": Write a compelling 2-3 paragraph letter if required.
-10. For salary: "Open to discussion".
-11. Return ONLY a JSON array.`;
+⚠ RULE ZERO — NO GUESSING: If you cannot determine the correct answer from the applicant data provided above with HIGH confidence, set action="skip". NEVER guess, invent, or hallucinate an answer. A blank field is always better than a wrong one. When in doubt, skip.
+
+FILL RULES:
+
+1. IDENTITY FIELDS
+   - First name → "${applicant.personal.firstName}"
+   - Last name → "${applicant.personal.lastName}"
+   - Full name → "${applicant.personal.firstName} ${applicant.personal.lastName}"
+   - Email → "${applicant.personal.email}"
+   - Phone/mobile → "${applicant.personal.phone}"
+   - City/location → "${applicant.personal.location}"
+
+2. WORK AUTHORIZATION QUESTIONS (yes/no/select patterns)
+   - "authorized to work in US / United States?" → "${workAuth.usAuthorized === "yes" ? "Yes" : workAuth.usAuthorized === "no" ? "No" : "SKIP"}" (SKIP if not set in profile)
+   - "authorized to work in Canada?" → "${workAuth.canadaAuthorized === "yes" ? "Yes" : workAuth.canadaAuthorized === "no" ? "No" : "SKIP"}" (SKIP if not set)
+   - "authorized to work in UK / United Kingdom?" → "${workAuth.ukAuthorized === "yes" ? "Yes" : workAuth.ukAuthorized === "no" ? "No" : "SKIP"}" (SKIP if not set)
+   - "require visa sponsorship?" / "need sponsorship now or future?" → "${workAuth.needsVisaSponsorship === "yes" ? "Yes" : "No"}"
+   - "work permit" / "right to work" → use country-specific authorization above
+   - For select dropdowns: match the closest option to Yes/No answer
+
+3. IN-PERSON / HYBRID / REMOTE QUESTIONS
+   - "open to working in-person X% of time?" → If X <= ${inPersonPct}, answer "Yes". If X > ${inPersonPct}, answer "No".
+   - "comfortable working hybrid?" → answer "Yes" if mode is hybrid or flexible
+   - "open to onsite/in-office?" → answer "Yes" if mode is onsite or flexible or hybrid
+   - "prefer remote?" → answer "${workMode === "remote" || workMode === "flexible" ? "Yes" : "No"}"
+   - For radio/select: choose the option that best matches the preference
+
+4. TRAVEL QUESTIONS
+   - "willing to travel X%?" or "travel requirement X%?" → If X <= ${travelPct}, answer "Yes". If X > ${travelPct}, answer "No".
+   - "open to business travel?" → "Yes" if travelPercent > 0
+
+5. RELOCATION QUESTIONS
+   - "willing to relocate?" → "${relocate}"
+   - "open to relocation?" → "${relocate}"
+
+6. SALARY / COMPENSATION
+   - "expected salary" / "desired compensation" → "${expectedSalary}"
+   - "current salary" / "current CTC" → use "Open to discussion" if not known
+   - "open to negotiation?" → "${sal.openToNegotiation === "no" ? "No" : "Yes"}"
+   - For numeric fields: use the numeric value from expected salary if available
+
+7. AVAILABILITY / NOTICE PERIOD
+   - "notice period?" / "how much notice do you need?" → "${noticePeriod}"
+   - "when can you start?" / "earliest start date?" → "${startDate}"
+   - "available immediately?" → "${startDate.toLowerCase().includes("immediately") ? "Yes" : "No"}"
+   - "currently employed?" → "${avail.currentlyEmployed === "yes" ? "Yes" : avail.currentlyEmployed === "no" ? "No" : "Yes"}"
+
+8. YEARS OF EXPERIENCE
+   - "years of experience in [technology/field]?" → Estimate based on resume experience
+   - "total years of experience?" → "${applicant.yearsExperience ?? applicant.experience.length ?? "3"}"
+   - For specific tech stack questions, check if it appears in experience/skills
+
+9. EDUCATION FIELDS
+   - University/school → "${applicant.education[0]?.institution ?? ""}"
+   - Degree → "${applicant.education[0]?.degree ?? ""}"
+   - Major/field of study → "${applicant.education[0]?.field_of_study ?? ""}"
+   - Graduation year → "${applicant.education[0]?.end_year ?? ""}"
+
+10. EEO / DEMOGRAPHIC QUESTIONS (all optional — use decline if not set)
+    - Gender → "${eeo.gender || "Decline to state"}"
+    - Veteran status → "${eeo.veteran || "Decline to state"}"
+    - Disability → "${eeo.disability || "Decline to state"}"
+    - Ethnicity → "${eeo.declineEthnicity ? "Decline to state" : (eeo.ethnicities?.join(", ") || "Decline to state")}"
+    - For dropdowns: select the matching option or "Prefer not to answer"
+
+11. LINKS
+    - LinkedIn URL → "${applicant.links.linkedin ?? ""}"
+    - Portfolio/website → "${applicant.links.portfolio ?? ""}"
+    - GitHub → "${applicant.links.github ?? ""}"
+
+12. COVER LETTER AND OPEN-ENDED QUESTIONS
+    - "cover letter" → Write 2-3 paragraphs. DO NOT dump the entire resume.
+    - "why this company?" / "why are you interested?" → Write 2-3 sentences referencing the applicant's skills and the role
+    - "tell us about yourself" → 2-3 sentence professional summary from experience
+    - "describe a project" / "describe experience with X" → Pick the most relevant experience entry
+
+13. YES/NO SCREENING QUESTIONS (for checkboxes, radios, or selects)
+    - "agree to terms / background check / drug test?" → check/Yes
+    - "are you 18 or older?" → Yes
+    - "do you have experience with [X]?" → Yes if X appears in skills or experience description
+    - "do you have a degree in [X]?" → check education
+
+14. GENERAL RULES
+    - NEVER dump the full resume text into a single field
+    - For text fields: max 200 characters unless it is clearly a large text area
+    - For "how did you hear about us?" or source/referral fields → action="skip" unless the applicant's profile explicitly has this info
+    - Skip fields already filled (currentValue is non-empty)
+    - Use action "skip" for password, hidden, captcha, and clearly irrelevant fields
+    - Use action "upload" for file inputs that ask for resume/CV
+    - If a field asks for something not in the applicant profile (hobby, favorite food, etc.) → action="skip"
+    - For select/dropdown/radio fields, use action="select" with the matching option text, or action="check" for radio/checkbox
+
+Actions available: "type" | "select" | "upload" | "check" | "click" | "skip"
+
+Return ONLY a valid JSON array. No explanation, no markdown fences.`;
 
   try {
     console.log("   🧠 Calling Gemini to analyze form fields...");
@@ -411,6 +668,18 @@ CRITICAL RULES:
 function ruleFill(fields: FormField[], applicant: ApplicantData): FillInstruction[] {
   const instructions: FillInstruction[] = [];
 
+  const workAuth = applicant.workAuth ?? {};
+  const avail = applicant.availability ?? {};
+  const sal = applicant.salary ?? {};
+  const prefs = applicant.workPreferences ?? {};
+  const eeo = applicant.eeo ?? {};
+
+  const noticePeriod = avail.noticePeriod || "2 weeks";
+  const startDate = avail.earliestStartDate || "Within 2 weeks";
+  const expectedSalary = sal.expected ? `${sal.expected} ${sal.currency ?? "USD"}` : "Open to discussion";
+  const inPersonPct = parseInt(prefs.inPersonPercent || "25", 10);
+  const travelPct = parseInt(prefs.travelPercent || "25", 10);
+
   for (const f of fields) {
     if (!f.isVisible) continue;
 
@@ -425,29 +694,83 @@ function ruleFill(fields: FormField[], applicant: ApplicantData): FillInstructio
     } else if (f.type === "checkbox") {
       if (hint.match(/agree|terms|consent|acknowledge|certif|author/i)) {
         action = "check";
+      } else if (hint.match(/currently.?work|current.?employer|still.?work/i)) {
+        action = "skip"; // depends on experience
       }
-    } else if (f.type === "select") {
-      // Skip selects in rule mode (too risky to guess)
-      action = "skip";
+    } else if (f.type === "radio" || f.type === "select" || f.tag === "custom-select") {
+      // Work authorization — only fill if explicitly set in profile
+      if (hint.match(/authoriz|eligible|legal.*(work|employ)|right to work/i)) {
+        if (hint.match(/us|united states|america/i) && workAuth.usAuthorized) {
+          action = "select"; value = workAuth.usAuthorized === "no" ? "No" : "Yes";
+        } else if (hint.match(/canada|canadian/i) && workAuth.canadaAuthorized) {
+          action = "select"; value = workAuth.canadaAuthorized === "no" ? "No" : "Yes";
+        } else if (hint.match(/uk|united kingdom|britain/i) && workAuth.ukAuthorized) {
+          action = "select"; value = workAuth.ukAuthorized === "no" ? "No" : "Yes";
+        }
+        // If not specified in profile, leave as skip
+      } else if (hint.match(/visa|sponsor/i) && workAuth.needsVisaSponsorship) {
+        action = "select"; value = workAuth.needsVisaSponsorship === "yes" ? "Yes" : "No";
+      } else if (hint.match(/relocat/i) && prefs.willingToRelocate) {
+        action = "select"; value = prefs.willingToRelocate === "no" ? "No" : "Yes";
+      } else if (hint.match(/remote|hybrid|onsite|in.?person|work.*mode|work.*type/i) && prefs.mode) {
+        action = "select"; value = prefs.mode;
+      } else if (hint.match(/gender/i) && eeo.gender) {
+        action = "select"; value = eeo.gender;
+      } else if (hint.match(/veteran|military/i) && eeo.veteran) {
+        action = "select"; value = eeo.veteran;
+      } else if (hint.match(/disabilit/i) && eeo.disability) {
+        action = "select"; value = eeo.disability || "Decline to state";
+      } else if (hint.match(/race|ethnic/i)) {
+        action = "select"; value = eeo.declineEthnicity ? "Decline to state" : (eeo.ethnicities?.[0] || "Decline to state");
+      } else if (hint.match(/employment.?type|job.?type/i) && applicant.roles?.employmentTypes?.length) {
+        action = "select"; value = applicant.roles.employmentTypes[0];
+      }
+      // "how did you hear" / source / referral → skip (no guessing)
     } else if (f.tag === "textarea" || f.type === "textarea") {
       if (hint.match(/cover|letter|why|about|yourself|message|interest/i)) {
         action = "type";
-        value = applicant.coverLetter ?? `Dear Hiring Manager,\n\nI am excited to apply for this position. I am confident I can make a meaningful contribution to your team.\n\nI bring a strong background in building reliable systems and collaborating across teams. I am eager to learn about this opportunity and discuss how my skills align with your needs.\n\nBest regards,\n${applicant.personal.firstName} ${applicant.personal.lastName}`;
+        value = applicant.coverLetter ?? `Dear Hiring Manager,\n\nI am writing to apply for this position. With ${applicant.yearsExperience ?? applicant.experience.length ?? "several"} years of experience in ${applicant.skills.slice(0, 3).join(", ")}, I am confident I can make a strong contribution.\n\nI look forward to discussing how my background aligns with your team's needs.\n\nBest regards,\n${applicant.personal.firstName} ${applicant.personal.lastName}`;
+      } else if (hint.match(/experience|background|descri/i)) {
+        action = "type";
+        value = applicant.experience.slice(0, 2).map(e => `${e.job_title} at ${e.company}: ${(e.description ?? "").slice(0, 150)}`).join("\n\n");
       }
     } else {
-      // Text-like inputs
-      if (hint.match(/first.?name/i)) { action = "type"; value = applicant.personal.firstName ?? ""; }
-      else if (hint.match(/last.?name|surname|family.?name/i)) { action = "type"; value = applicant.personal.lastName ?? ""; }
-      else if (hint.match(/full.?name/i)) { action = "type"; value = `${applicant.personal.firstName} ${applicant.personal.lastName}`; }
-      else if (hint.match(/email/i) || f.type === "email") { action = "type"; value = applicant.personal.email ?? ""; }
-      else if (hint.match(/phone|mobile|cell/i) || f.type === "tel") { action = "type"; value = applicant.personal.phone ?? ""; }
-      else if (hint.match(/city|location|address/i)) { action = "type"; value = applicant.personal.location ?? ""; }
-      else if (hint.match(/linkedin/i)) { action = "type"; value = applicant.links.linkedin ?? ""; }
-      else if (hint.match(/portfolio|website|github|url/i)) { action = "type"; value = applicant.links.portfolio ?? applicant.links.linkedin ?? ""; }
-      else if (hint.match(/year.*experience/i)) { action = "type"; value = applicant.yearsExperience ?? "5"; }
-      else if (hint.match(/salary|compensation|pay/i)) { action = "type"; value = "Open to discussion based on total compensation"; }
-      else if (hint.match(/start.?date|available|earliest/i)) { action = "type"; value = "Within 2 weeks"; }
-      else if (hint.match(/source|how.*hear|referr/i)) { action = "type"; value = "Company website"; }
+      // Text-like inputs — only fill if we have the data (empty string = stay as skip)
+      if (hint.match(/first.?name/i) && applicant.personal.firstName) { action = "type"; value = applicant.personal.firstName; }
+      else if (hint.match(/last.?name|surname|family.?name/i) && applicant.personal.lastName) { action = "type"; value = applicant.personal.lastName; }
+      else if (hint.match(/full.?name/i) && applicant.personal.firstName) { action = "type"; value = `${applicant.personal.firstName} ${applicant.personal.lastName}`; }
+      else if ((hint.match(/email/i) || f.type === "email") && applicant.personal.email) { action = "type"; value = applicant.personal.email; }
+      else if ((hint.match(/phone|mobile|cell/i) || f.type === "tel") && applicant.personal.phone) { action = "type"; value = applicant.personal.phone; }
+      else if (hint.match(/city|location|address/i) && applicant.personal.location) { action = "type"; value = applicant.personal.location; }
+      else if (hint.match(/linkedin/i) && applicant.links.linkedin) { action = "type"; value = applicant.links.linkedin; }
+      else if (hint.match(/github/i) && applicant.links.github) { action = "type"; value = applicant.links.github; }
+      else if (hint.match(/portfolio|website/i) && (applicant.links.portfolio || applicant.links.linkedin)) { action = "type"; value = applicant.links.portfolio ?? applicant.links.linkedin ?? ""; }
+      else if (hint.match(/year.*experience|experience.*year/i) && (applicant.yearsExperience || applicant.experience.length)) { action = "type"; value = applicant.yearsExperience ?? String(applicant.experience.length); }
+      else if (hint.match(/notice.?period/i) && avail.noticePeriod) { action = "type"; value = noticePeriod; }
+      else if (hint.match(/start.?date|earliest|when.*start/i) && avail.earliestStartDate) { action = "type"; value = startDate; }
+      else if (hint.match(/salary|compensation|pay|ctc|expected/i) && sal.expected) { action = "type"; value = expectedSalary; }
+      else if (hint.match(/school|university|college|institution/i) && applicant.education[0]?.institution) { action = "type"; value = applicant.education[0].institution!; }
+      else if (hint.match(/degree|qualification/i) && applicant.education[0]?.degree) { action = "type"; value = applicant.education[0].degree!; }
+      else if (hint.match(/major|field.?of.?study|specializ/i) && applicant.education[0]?.field_of_study) { action = "type"; value = applicant.education[0].field_of_study!; }
+      else if (hint.match(/graduation|grad.?year/i) && applicant.education[0]?.end_year) { action = "type"; value = String(applicant.education[0].end_year); }
+      else if (hint.match(/current.?title|job.?title|position/i) && applicant.experience[0]?.job_title) { action = "type"; value = applicant.experience[0].job_title!; }
+      else if (hint.match(/current.?company|employer/i) && applicant.experience[0]?.company) { action = "type"; value = applicant.experience[0].company!; }
+      // In-person % checks
+      else if (hint.match(/in.?person|onsite|office.*(\d+)%|(\d+)%.*office/i) && prefs.inPersonPercent) {
+        const pctMatch = hint.match(/(\d+)%/);
+        if (pctMatch) {
+          const required = parseInt(pctMatch[1], 10);
+          action = "type"; value = required <= inPersonPct ? "Yes" : "No";
+        }
+      }
+      // Travel % checks
+      else if (hint.match(/travel.*(\d+)%|(\d+)%.*travel/i) && prefs.travelPercent) {
+        const pctMatch = hint.match(/(\d+)%/);
+        if (pctMatch) {
+          const required = parseInt(pctMatch[1], 10);
+          action = "type"; value = required <= travelPct ? "Yes" : "No";
+        }
+      }
     }
 
     if (action !== "skip" && value) {
@@ -512,21 +835,61 @@ async function executeFillInstructions(
         }
 
         case "select": {
+          let selectSuccess = false;
+
+          // 1. Native <select> — exact match
           try {
-            // Try exact match first
-            await el.selectOption({ label: instr.value });
-          } catch {
-            // Try partial match
+            await el.selectOption({ label: instr.value }, { timeout: 2000 });
+            selectSuccess = true;
+          } catch { /* try partial */ }
+
+          // 2. Native <select> — partial / case-insensitive match
+          if (!selectSuccess) {
             try {
               const options = await el.locator("option").allTextContents();
-              const match = options.find(o => o.toLowerCase().includes(instr.value.toLowerCase()));
+              const match = options.find(o =>
+                o.toLowerCase().includes(instr.value.toLowerCase()) ||
+                instr.value.toLowerCase().includes(o.toLowerCase().trim())
+              );
               if (match) {
-                await el.selectOption({ label: match });
+                await el.selectOption({ label: match }, { timeout: 2000 });
+                selectSuccess = true;
               }
-            } catch { /* skip */ }
+            } catch { /* fall through */ }
           }
-          filled++;
-          await log?.(`Selected: "${instr.value}"`);
+
+          // 3. Custom ATS dropdowns (React-Select, Workday, Greenhouse, etc.)
+          //    Click the container to open, then find option by text
+          if (!selectSuccess) {
+            try {
+              await el.click({ timeout: 3000 });
+              await page.waitForTimeout(500);
+              const escaped = instr.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const valueRe = new RegExp(escaped, 'i');
+              const candidateLocators = [
+                page.locator(`[role="option"]`).filter({ hasText: valueRe }),
+                page.locator(`[role="listbox"] li`).filter({ hasText: valueRe }),
+                page.locator(`li[class*="option"]`).filter({ hasText: valueRe }),
+                page.locator(`[class*="menu"] [class*="option"]`).filter({ hasText: valueRe }),
+                page.locator(`[class*="dropdown"] li`).filter({ hasText: valueRe }),
+              ];
+              for (const loc of candidateLocators) {
+                if (await loc.count() > 0 && await loc.first().isVisible().catch(() => false)) {
+                  await loc.first().click({ timeout: 2000 });
+                  selectSuccess = true;
+                  break;
+                }
+              }
+              if (!selectSuccess) await page.keyboard.press("Escape").catch(() => {});
+            } catch { /* give up */ }
+          }
+
+          if (selectSuccess) {
+            filled++;
+            await log?.(`Selected: "${instr.value}"`);
+          } else {
+            failed++;
+          }
           break;
         }
 
@@ -675,7 +1038,18 @@ async function prepareCanonicalResumeFile(
   const resumeCanonical = applicant.resumeCanonical;
 
   if (!resumeCanonical) {
-    throw new Error("Missing canonical resume — aborting application");
+    // Fallback: use raw resumeText to build a simple PDF
+    if (applicant.resumeText) {
+      try {
+        const filePath = await prepareResumeFile(applicant.resumeText, applicationId);
+        await log("Prepared resume for upload (from resumeText fallback)");
+        return filePath;
+      } catch (error) {
+        await log(`Resume preparation failed: ${error instanceof Error ? error.message : "unknown error"}`);
+        throw error;
+      }
+    }
+    throw new Error("Missing canonical resume and no resumeText — cannot upload resume");
   }
 
   const computed = buildResumeCanonical(resumeCanonical);
@@ -685,7 +1059,7 @@ async function prepareCanonicalResumeFile(
   }
 
   try {
-    const filePath = await prepareResumeFile(resumeCanonical.rawText, applicationId);
+    const filePath = await prepareResumeFile(computed, applicationId);
     await log(`Prepared resume for upload (Canonical)`);
     return filePath;
   } catch (error) {
@@ -763,7 +1137,12 @@ export async function intelligentlyFillPage(
 
   // Prepare resume file in case we need to upload it
   let resumePath: string | undefined;
-  resumePath = await prepareCanonicalResumeFile(applicant, Date.now().toString(), log);
+  try {
+    resumePath = await prepareCanonicalResumeFile(applicant, Date.now().toString(), log);
+  } catch (err) {
+    await log(`Resume file preparation skipped: ${err instanceof Error ? err.message : "unknown"}`);
+    resumePath = undefined;
+  }
 
   for (let pageNum = 0; pageNum < maxPages; pageNum++) {
     pagesProcessed++;

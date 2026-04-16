@@ -64,6 +64,25 @@ const LinkProfileSchema = z.object({
   other: z.string().default("")
 });
 
+const SalaryPreferencesSchema = z.object({
+  expected: z.string().default(""),
+  currency: z.string().default("USD"),
+  openToNegotiation: z.union([z.literal("yes"), z.literal("no"), z.literal("")]).default("")
+});
+
+const AvailabilitySchema = z.object({
+  noticePeriod: z.string().default(""),
+  earliestStartDate: z.string().default(""),
+  currentlyEmployed: z.union([z.literal("yes"), z.literal("no"), z.literal("")]).default("")
+});
+
+const WorkPreferencesSchema = z.object({
+  mode: z.string().default(""),
+  willingToRelocate: z.union([z.literal("yes"), z.literal("no"), z.literal("")]).default(""),
+  travelPercent: z.string().default(""),
+  inPersonPercent: z.string().default("")
+});
+
 const UserProfileSchema = z.object({
   firstName: z.string().default(""),
   lastName: z.string().default(""),
@@ -83,6 +102,9 @@ const UserProfileSchema = z.object({
   skills: z.array(SkillEntrySchema).optional(),
   personal: PersonalProfileSchema.optional(),
   links: LinkProfileSchema.optional(),
+  salary: SalaryPreferencesSchema.optional(),
+  availability: AvailabilitySchema.optional(),
+  workPreferences: WorkPreferencesSchema.optional(),
   answers: z.record(z.string()).optional(),
   projects: z.array(z.record(z.unknown())).optional()
 });
@@ -155,6 +177,22 @@ const EMPTY_PROFILE: UserProfilePayload = {
     portfolio: "",
     other: ""
   },
+  salary: {
+    expected: "",
+    currency: "USD",
+    openToNegotiation: ""
+  },
+  availability: {
+    noticePeriod: "",
+    earliestStartDate: "",
+    currentlyEmployed: ""
+  },
+  workPreferences: {
+    mode: "",
+    willingToRelocate: "",
+    travelPercent: "",
+    inPersonPercent: ""
+  },
   answers: {},
   projects: []
 };
@@ -165,6 +203,9 @@ type ProjectsEnvelope = {
   eeo?: UserProfilePayload["eeo"];
   personal?: UserProfilePayload["personal"];
   links?: UserProfilePayload["links"];
+  salary?: UserProfilePayload["salary"];
+  availability?: UserProfilePayload["availability"];
+  workPreferences?: UserProfilePayload["workPreferences"];
   answers?: UserProfilePayload["answers"];
   projects?: Array<Record<string, unknown>>;
   identity?: {
@@ -230,6 +271,9 @@ function fromRecordToProfile(record: {
     eeo: envelope.eeo ?? EMPTY_PROFILE.eeo,
     personal: envelope.personal ?? EMPTY_PROFILE.personal,
     links: envelope.links ?? EMPTY_PROFILE.links,
+    salary: envelope.salary ?? EMPTY_PROFILE.salary,
+    availability: envelope.availability ?? EMPTY_PROFILE.availability,
+    workPreferences: envelope.workPreferences ?? EMPTY_PROFILE.workPreferences,
     answers: envelope.answers ?? EMPTY_PROFILE.answers,
     projects: envelope.projects ?? []
   };
@@ -250,6 +294,9 @@ function toStoredColumns(profile: UserProfilePayload): {
     eeo: profile.eeo ?? EMPTY_PROFILE.eeo,
     personal: profile.personal ?? EMPTY_PROFILE.personal,
     links: profile.links ?? EMPTY_PROFILE.links,
+    salary: profile.salary ?? EMPTY_PROFILE.salary,
+    availability: profile.availability ?? EMPTY_PROFILE.availability,
+    workPreferences: profile.workPreferences ?? EMPTY_PROFILE.workPreferences,
     answers: profile.answers ?? EMPTY_PROFILE.answers,
     projects: profile.projects ?? [],
     identity: {

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import pdfWorkerSrc from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import {
   createApplication,
   getApplication,
   getLatestPreview,
+  listApplications,
   pauseApplication,
   resumeApplication,
   subscribeToApplication,
@@ -84,7 +85,7 @@ type MainDashboardScreenProps = {
   onLogout: () => void;
 };
 
-type DashboardNavItem = "Apply" | "Applications" | "ApplicationDetail" | "Jobs" | "Settings";
+type DashboardNavItem = "Apply" | "Applications" | "ApplicationDetail" | "Jobs" | "Settings" | "Tracker";
 type ApplyMode = "assist" | "smart_auto" | "full_auto";
 
 type JobHistoryItem = {
@@ -108,7 +109,7 @@ type DashboardJobRecord = {
 };
 
 type ApplicationPipelineStage = {
-  key: "optimize" | "resume" | "generate" | "cover_letter" | "submit" | "done";
+  key: "optimize" | "resume" | "cover_letter" | "submit" | "done";
   label: string;
 };
 
@@ -118,7 +119,6 @@ const RESUME_PDF_NAME_KEY = "autoapply_resume_pdf_name";
 const APPLICATION_PIPELINE: ApplicationPipelineStage[] = [
   { key: "optimize", label: "Optimize" },
   { key: "resume", label: "Resume" },
-  { key: "generate", label: "Generate" },
   { key: "cover_letter", label: "Cover Letter" },
   { key: "submit", label: "Submit" },
   { key: "done", label: "Done" }
@@ -129,12 +129,12 @@ function mapBackendStepToPipelineIndex(currentStep: string, status: string): num
   const state = (status || "").toLowerCase();
 
   if (step.includes("submitted") || state.includes("submitted") || state.includes("completed") || state.includes("success")) {
-    return 5;
-  }
-  if (step.includes("browser_started") || step.includes("logged_in") || step.includes("form_filled")) {
     return 4;
   }
-  if (step.includes("answers_generated")) return 3;
+  if (step.includes("browser_started") || step.includes("logged_in") || step.includes("form_filled")) {
+    return 3;
+  }
+  if (step.includes("answers_generated")) return 2;
   if (step.includes("resume_optimized")) return 1;
   if (step.includes("job_analyzed") || step.includes("job_scraped") || step.includes("queued")) return 0;
   return 0;
@@ -569,6 +569,25 @@ function extractLatestResumeOptimization(events: EventLog[]): ResumeOptimization
   return null;
 }
 
+function extractCoverLetterFromEvents(events: EventLog[]): string | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.step !== "answers_generated") continue;
+    const payload = event.payloadJson ?? {};
+    const cl = payload.coverLetter;
+    if (typeof cl === "string" && cl.trim().length > 30) {
+      return cl.trim();
+    }
+    // Also check inside answers object
+    const answers = payload.answers as Record<string, string> | undefined;
+    const fromAnswers = answers?.["cover-letter"] ?? answers?.["coverLetter"];
+    if (typeof fromAnswers === "string" && fromAnswers.trim().length > 30) {
+      return fromAnswers.trim();
+    }
+  }
+  return null;
+}
+
 function buildResumeDiffFromPayload(payload: ResumeOptimizationPayload): ResumeDiffLine[] {
   const beforeLines = payload.originalResume.split(/\r?\n/);
   const canonicalText = isValidResumeCanonical(payload.resumeCanonical)
@@ -598,28 +617,158 @@ function buildApprovalAnswers(params: {
   analysis: AnalyzeJobResponse | null;
   profile: UserProfile;
   targetRole: string;
+  resumeCanonical?: ResumeCanonical | null;
+  jobDescription?: string;
 }): Array<{ prompt: string; answer: string }> {
+  const normalizeText = (value: string): string => value.replace(/\s+/g, " ").trim();
+  const decapitalize = (value: string): string => (value ? `${value.charAt(0).toLowerCase()}${value.slice(1)}` : value);
+  const isNoisyHighlight = (value: string): boolean => {
+    const text = normalizeText(value);
+    if (!text) return true;
+    if (text.length < 12) return true;
+    if (/@|https?:\/\/|www\.|linkedin\.com|github\.com/i.test(text)) return true;
+    if (/\+?\d[\d\s()\-.]{6,}/.test(text)) return true;
+    if (/^(email|phone|location|portfolio|linkedin|github|education)\b/i.test(text)) return true;
+    return false;
+  };
+  const ensureSentence = (value: string): string => {
+    const text = normalizeText(value);
+    if (!text) return "";
+    return /[.!?]$/.test(text) ? text : `${text}.`;
+  };
+  const formatList = (items: string[]): string => {
+    if (items.length === 0) return "";
+    if (items.length === 1) return items[0];
+    if (items.length === 2) return `${items[0]} and ${items[1]}`;
+    return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+  };
+  const tokenize = (value: string): string[] => {
+    return normalizeText(value)
+      .toLowerCase()
+      .replace(/[^a-z0-9+\s]/g, " ")
+      .split(/\s+/)
+      .map((token) => SKILL_ALIASES[token] ?? token)
+      .filter((token) => token.length > 1 && !FIT_STOP_WORDS.has(token));
+  };
   const company = params.analysis?.job.company || "this company";
   const role = params.analysis?.job.title || params.targetRole || "this role";
+  const fullName = `${params.profile.firstName || ""} ${params.profile.lastName || ""}`.trim() || "Candidate";
+  const yearsExperience = (params.profile.yearsExperience || "").trim();
   const topSkills = params.analysis?.analysis.matched_skills.slice(0, 2) ?? [];
   const resumeSignal = params.profile.resumeText?.trim() ? "uploaded resume" : "profile details";
+  const profileSkillSignals = (params.profile.skills ?? [])
+    .map((skill) => skill.name?.trim())
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 4);
+  const jobSignals = [
+    ...(params.analysis?.details.requiredSkills ?? []),
+    ...(params.analysis?.details.preferredSkills ?? []),
+    ...(params.analysis?.analysis.matched_skills ?? [])
+  ]
+    .map((value) => value.trim())
+    .filter((value, index, all) => value.length > 0 && all.findIndex((entry) => entry.toLowerCase() === value.toLowerCase()) === index)
+    .slice(0, 4);
+
+  const targetSignalTerms = Array.from(new Set([
+    ...tokenize(role),
+    ...tokenize(topSkills.join(" ")),
+    ...tokenize(jobSignals.join(" "))
+  ])).slice(0, 16);
+
+  const rawExperienceRecords = [
+    ...(params.profile.experience ?? []).map((entry) => ({
+      title: normalizeText(entry.title || ""),
+      companyName: normalizeText(entry.company || ""),
+      detail: normalizeText(entry.description || "")
+    })),
+    ...(params.resumeCanonical?.experience ?? []).map((entry) => ({
+      title: normalizeText(entry.title || ""),
+      companyName: normalizeText(entry.company || entry.organization || ""),
+      detail: normalizeText((entry.bullets ?? []).find((bullet) => !isNoisyHighlight(bullet)) || "")
+    }))
+  ];
+
+  const experienceRecords = rawExperienceRecords
+    .map((entry) => {
+      const searchable = normalizeText([entry.title, entry.companyName, entry.detail].filter(Boolean).join(" "));
+      if (!searchable || isNoisyHighlight(searchable)) return null;
+
+      const normalizedTokens = new Set(tokenize(searchable));
+      const matchedSignals = targetSignalTerms.filter((term) => normalizedTokens.has(term)).slice(0, 3);
+      const score = matchedSignals.length;
+
+      return {
+        ...entry,
+        matchedSignals,
+        score
+      };
+    })
+    .filter((entry): entry is { title: string; companyName: string; detail: string; matchedSignals: string[]; score: number } => !!entry)
+    .sort((a, b) => b.score - a.score || b.detail.length - a.detail.length);
+
+  const selectedExperience = (experienceRecords.filter((entry) => entry.score > 0).slice(0, 2).length > 0
+    ? experienceRecords.filter((entry) => entry.score > 0).slice(0, 2)
+    : experienceRecords.slice(0, 2));
+
+  const selectedSignals = Array.from(new Set(selectedExperience.flatMap((entry) => entry.matchedSignals))).slice(0, 4);
+
+  const jobLeadIn = params.jobDescription?.trim().split(/\r?\n/).find(Boolean) || params.analysis?.job.tldr || `the ${role} opportunity`;
+  const experienceParagraph = selectedExperience.length > 0
+    ? selectedExperience
+      .map((entry) => {
+        const roleLabel = entry.title || "recent";
+        const companyLabel = entry.companyName ? ` at ${entry.companyName}` : "";
+        const detailSentence = ensureSentence(entry.detail || `I delivered outcomes relevant to ${role}.`);
+        const signalSentence = entry.matchedSignals.length > 0
+          ? ` This included direct work in ${formatList(entry.matchedSignals.slice(0, 2))}.`
+          : "";
+        return `In my ${roleLabel}${companyLabel} role, ${decapitalize(detailSentence)}${signalSentence}`;
+      })
+      .join(" ")
+    : profileSkillSignals.length > 0
+      ? `My background includes hands-on delivery with ${formatList(profileSkillSignals)}, with a focus on measurable business impact.`
+      : yearsExperience
+        ? `I bring ${yearsExperience} years of experience delivering production-ready solutions and collaborating across product, engineering, and operations.`
+        : "My background reflects practical execution, cross-functional collaboration, and a strong focus on measurable outcomes.";
+  const alignmentParagraph = selectedSignals.length > 0
+    ? `The role emphasizes ${formatList(jobSignals.length > 0 ? jobSignals : selectedSignals)}, and my experience demonstrates practical depth in ${formatList(selectedSignals)}.`
+    : jobSignals.length > 0
+      ? `The job description emphasizes ${formatList(jobSignals)}, and that aligns directly with the projects and responsibilities in my experience.`
+    : "The role expectations align closely with my background in shipping reliable, user-focused solutions.";
+  const coverLetter = [
+    `Dear Hiring Manager,`,
+    ``,
+    `I am excited to apply for the ${role} role at ${company}.`,
+    `${ensureSentence(jobLeadIn)} This opportunity aligns with the kind of work I have delivered in similar environments.`,
+    experienceParagraph,
+    alignmentParagraph,
+    ``,
+    `I would welcome the opportunity to bring that experience to ${company} and contribute to the priorities reflected in the job description.`,
+    ``,
+    `Best regards,`,
+    fullName
+  ].join("\n");
 
   return [
     {
       prompt: "Why do you want to join this company?",
       answer:
         params.profile.whyCompany?.trim() ||
-        `I want to join ${company} because the ${role} scope aligns with my ${resumeSignal} and the impact I have delivered in similar environments.`
+        `I want to join ${company} because the ${role} scope aligns with my ${resumeSignal} and my past delivery in ${formatList(selectedSignals.length > 0 ? selectedSignals : topSkills)}.`
     },
     {
       prompt: "How many years of experience do you have?",
-      answer: `${params.profile.yearsExperience || "3"} years in modern frontend engineering.`
+      answer: `${params.profile.yearsExperience || "3"} years of experience delivering work aligned with ${role}.`
     },
     {
       prompt: "What makes you a strong fit for this role?",
       answer: topSkills.length
         ? `My background maps well to this role through ${topSkills.join(" and ")}, with hands-on delivery from the projects in my uploaded resume.`
         : "My profile and uploaded resume show end-to-end ownership, cross-functional delivery, and measurable execution outcomes."
+    },
+    {
+      prompt: "Cover letter",
+      answer: coverLetter
     }
   ];
 }
@@ -941,6 +1090,9 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
   const latestResumeOptimization = useMemo(() => {
     return extractLatestResumeOptimization(runData?.events ?? []);
   }, [runData?.events]);
+  const aiCoverLetter = useMemo(() => {
+    return extractCoverLetterFromEvents(runData?.events ?? []);
+  }, [runData?.events]);
   const isValidCanonical = useMemo(
     () => isValidResumeCanonical(latestResumeOptimization?.resumeCanonical),
     [latestResumeOptimization?.resumeCanonical]
@@ -987,8 +1139,14 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
     return items.slice(0, 3);
   }, [latestResumeOptimization, matchedSkills, syncedResumeDiff]);
   const generatedAnswers = useMemo(
-    () => buildApprovalAnswers({ analysis: activeAnalysis, profile, targetRole }),
-    [activeAnalysis, profile, targetRole]
+    () => buildApprovalAnswers({
+      analysis: activeAnalysis,
+      profile,
+      targetRole,
+      resumeCanonical: latestResumeOptimization?.resumeCanonical,
+      jobDescription: activeAnalysis ? `${activeAnalysis.job.title} - ${activeAnalysis.job.tldr}` : undefined
+    }),
+    [activeAnalysis, latestResumeOptimization?.resumeCanonical, profile, targetRole]
   );
 
   const eventPreviewUrl = useMemo(() => {
@@ -1030,6 +1188,40 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
 
   useEffect(() => {
     setJobHistory(readJobHistoryFromStorage());
+  }, []);
+
+  useEffect(() => {
+    const syncFromBackend = async () => {
+      try {
+        const runs = await listApplications(30);
+        if (!runs.length) return;
+
+        setJobHistory((previous) => {
+          const merged = new Map(previous.map((item) => [item.id, item]));
+          runs.forEach((run) => {
+            merged.set(run.id, {
+              id: run.id,
+              jobUrl: run.jobUrl,
+              targetRole: run.targetRole || "Untitled role",
+              status: run.status,
+              currentStep: run.currentStep,
+              updatedAt: run.updatedAt
+            });
+          });
+
+          const next = Array.from(merged.values())
+            .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+            .slice(0, 30);
+
+          writeJobHistoryToStorage(next);
+          return next;
+        });
+      } catch {
+        // Ignore list hydration failures and keep local cache.
+      }
+    };
+
+    void syncFromBackend();
   }, []);
 
   useEffect(() => {
@@ -1193,8 +1385,17 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
   }, [allJobs, profile]);
 
   const currentApplications = useMemo(() => {
-    const active = jobHistory.filter((item) => isActiveApplicationStatus(item.status));
-    return active.length > 0 ? active : jobHistory;
+    return [...jobHistory]
+      .filter((item) => isActiveApplicationStatus(item.status))
+      .sort((a, b) => {
+        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      });
+  }, [jobHistory]);
+
+  const trackerApplications = useMemo(() => {
+    return [...jobHistory]
+      .filter((item) => !isActiveApplicationStatus(item.status))
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   }, [jobHistory]);
 
   const selectedApplicationItem = useMemo(() => {
@@ -1216,37 +1417,18 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
     );
   }, [selectedApplicationItem, selectedApplicationRun]);
 
-  const isTerminalApplicationRun = useMemo(() => {
-    if (!selectedApplicationItem) return false;
-    const status = (selectedApplicationRun?.status ?? selectedApplicationItem.status ?? "").toLowerCase();
-    return (
-      status.includes("submitted") ||
-      status.includes("completed") ||
-      status.includes("success") ||
-      status.includes("failed") ||
-      status.includes("cancelled")
-    );
-  }, [selectedApplicationItem, selectedApplicationRun]);
-
   const activePipelineIndex = useMemo(() => {
     if (!selectedApplicationItem) return 0;
     const override = pipelineStageOverrideByRun[selectedApplicationItem.id];
 
-    // For active runs, stay at Resume unless user explicitly continues.
-    if (!isTerminalApplicationRun) {
-      if (typeof override === "number") {
-        return Math.max(0, Math.min(5, override));
-      }
-      if (backendPipelineIndex <= 1) return backendPipelineIndex;
-      return 1;
-    }
-
+    // Manual gating: do not jump past Resume/Cover Letter without explicit user approval.
     if (typeof override === "number") {
-      return Math.max(backendPipelineIndex, override);
+      return Math.max(0, Math.min(4, override));
     }
 
-    return backendPipelineIndex;
-  }, [backendPipelineIndex, isTerminalApplicationRun, pipelineStageOverrideByRun, selectedApplicationItem]);
+    if (backendPipelineIndex <= 0) return 0;
+    return 1;
+  }, [backendPipelineIndex, pipelineStageOverrideByRun, selectedApplicationItem]);
   const activePipelineStage = APPLICATION_PIPELINE[activePipelineIndex]?.key ?? "optimize";
 
   const resumePreviewState = useMemo(() => {
@@ -1257,6 +1439,9 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
     const hasDiff = Boolean(canonicalReady && (latestResumeOptimization?.diff?.length || syncedResumeDiff.length));
     const resumeType = canonicalReady ? "Optimized Resume" : "Original Resume";
     const showLoading = !canonicalData && !originalText.trim();
+    const tailoringError = latestResumeOptimization?.tailoringError;
+    const optimizationMatchedSkills = latestResumeOptimization?.resumeCanonical?.keywordsInjected ?? [];
+    const jdKeywords = activeAnalysis?.details.keywords ?? [];
 
     return {
       canonicalData,
@@ -1264,9 +1449,12 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
       resumeType,
       showLoading,
       hasDiff,
-      canonicalReady
+      canonicalReady,
+      tailoringError,
+      matchedSkills: optimizationMatchedSkills,
+      jdKeywords
     };
-  }, [canonicalReady, latestResumeOptimization, profile.resumeText, syncedResumeDiff.length]);
+  }, [activeAnalysis, canonicalReady, latestResumeOptimization, profile.resumeText, syncedResumeDiff.length]);
   const resumePreviewLinks = useMemo(() => {
     const values = [
       profile.links?.linkedin || profile.linkedIn || "",
@@ -1399,35 +1587,22 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
   }, [createPayload, pushToast, upsertJobHistory]);
 
   const refreshApplications = useCallback(async () => {
-    if (jobHistory.length === 0) return;
-
     setApplicationsRefreshing(true);
     try {
-      const ids = jobHistory.map((item) => item.id);
-      const results = await Promise.all(
-        ids.map(async (id) => {
-          try {
-            return await getApplication(id);
-          } catch {
-            return null;
-          }
-        })
-      );
-
-      const valid = results.filter((item): item is AppData => !!item);
-      if (valid.length === 0) return;
+      const runs = await listApplications(30);
+      if (runs.length === 0) return;
 
       setJobHistory((previous) => {
         const merged = new Map(previous.map((item) => [item.id, item]));
 
-        valid.forEach((details) => {
-          merged.set(details.id, {
-            id: details.id,
-            jobUrl: details.jobUrl,
-            targetRole: details.targetRole || "Untitled role",
-            status: details.status,
-            currentStep: details.currentStep,
-            updatedAt: new Date().toISOString()
+        runs.forEach((run) => {
+          merged.set(run.id, {
+            id: run.id,
+            jobUrl: run.jobUrl,
+            targetRole: run.targetRole || "Untitled role",
+            status: run.status,
+            currentStep: run.currentStep,
+            updatedAt: run.updatedAt
           });
         });
 
@@ -1441,7 +1616,7 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
     } finally {
       setApplicationsRefreshing(false);
     }
-  }, [jobHistory]);
+  }, []);
 
   const openApplicationRun = useCallback(async (item: JobHistoryItem) => {
     setApplicationOpeningId(item.id);
@@ -1726,7 +1901,7 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
                             : "bg-slate-200 text-slate-500"
                       }`}
                     >
-                      {completed ? "✓" : index + 1}
+                      {completed ? "Γ£ô" : index + 1}
                     </div>
                     <p className={`text-xs ${current ? "font-semibold text-slate-900" : "text-slate-500"}`}>{stage.label}</p>
                   </div>
@@ -1772,7 +1947,7 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
                 <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
                   <h3 className="text-lg font-semibold text-slate-900">Resume Review</h3>
                   {backendPipelineIndex > 1 ? (
-                    <p className="text-xs text-slate-500">Resume optimization is complete. Click Continue to move to cover letter generation.</p>
+                    <p className="text-xs text-slate-500">Resume optimization is complete. Click Continue to move to cover letter review.</p>
                   ) : null}
                   
                   {latestResumeOptimization?.tailoringTriggered && latestResumeOptimization?.fallbackUsed && (
@@ -1829,43 +2004,51 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
               ) : null}
 
               {activePipelineIndex === 2 ? (
-                <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-                  <h3 className="text-lg font-semibold text-slate-900">Cover Letter Generation</h3>
-                  <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-8 text-center">
-                    <p className="text-sm text-slate-600">Generating cover letter...</p>
-                  </div>
-                  <div className="mt-3">
-                    <Button
-                      type="button"
-                      variant="default"
-                      onClick={() => promoteApplicationPipelineStage(selectedApplicationItem.id, 3)}
-                    >
-                      Continue to Cover Letter Review
-                    </Button>
-                  </div>
-                </div>
-              ) : null}
-
-              {activePipelineIndex === 3 ? (
                 <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-                  <h3 className="text-lg font-semibold text-slate-900">Cover Letter Review</h3>
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
-                    <p className="text-xs uppercase tracking-wide text-slate-500">AI Generated</p>
-                    <p className="mt-2 whitespace-pre-wrap">{generatedAnswers.find((item) => item.prompt.toLowerCase().includes("why"))?.answer || profile.whyCompany || "Generated cover letter text is ready for review."}</p>
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold text-slate-900">Cover Letter Review</h3>
+                    {aiCoverLetter ? (
+                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">Powered by AI ✦</span>
+                    ) : null}
                   </div>
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                    <p className="font-semibold text-slate-700">Why this works</p>
-                    <p className="mt-1">Connects your proof points to the role scope, highlights impact, and keeps recruiter-friendly clarity.</p>
-                  </div>
+                  {aiCoverLetter ? (
+                    <div className="rounded-lg border border-emerald-100 bg-emerald-50/40 p-4 text-sm text-slate-800">
+                      <div className="mb-2 flex items-center gap-2">
+                        <p className="text-xs font-medium uppercase tracking-wide text-emerald-700">AI Generated · Tailored to Job &amp; Resume</p>
+                        <span className="ml-auto text-xs text-slate-400">{aiCoverLetter.split(/\s+/).filter(Boolean).length} words</span>
+                      </div>
+                      <div className="whitespace-pre-wrap leading-relaxed">{aiCoverLetter}</div>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+                      {(() => {
+                        const fallback =
+                          generatedAnswers.find((item) => item.prompt.toLowerCase().includes("cover letter"))?.answer ||
+                          generatedAnswers.find((item) => item.prompt.toLowerCase().includes("why"))?.answer ||
+                          profile.whyCompany;
+                        return fallback ? (
+                          <>
+                            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-500">Cover Letter</p>
+                            <p className="whitespace-pre-wrap leading-relaxed">{fallback}</p>
+                          </>
+                        ) : (
+                          <div className="flex items-center gap-2 py-4 text-slate-500">
+                            <span className="h-2 w-2 animate-pulse rounded-full bg-slate-400" />
+                            <span className="text-sm">Generating personalised cover letter...</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
                   <div className="flex flex-wrap gap-2">
-                    <Button type="button" variant="ghost" onClick={() => onEditProfile()}>Edit</Button>
-                    <Button type="button" variant="default" onClick={() => promoteApplicationPipelineStage(selectedApplicationItem.id, 4)}>Approve</Button>
-                    <Button type="button" variant="ghost" onClick={() => promoteApplicationPipelineStage(selectedApplicationItem.id, 4)}>Skip</Button>
+                    <Button type="button" variant="ghost" onClick={() => onEditProfile()}>Edit Profile</Button>
+                    <Button type="button" variant="default" onClick={() => promoteApplicationPipelineStage(selectedApplicationItem.id, 3)}>Approve</Button>
+                    <Button type="button" variant="ghost" onClick={() => promoteApplicationPipelineStage(selectedApplicationItem.id, 3)}>Skip</Button>
                   </div>
                 </div>
               ) : null}
 
-              {activePipelineIndex >= 4 ? (
+              {activePipelineIndex >= 3 ? (
                 <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
                   <div className="flex items-center justify-between">
                     <h3 className="text-lg font-semibold text-slate-900">Automation</h3>
@@ -1873,10 +2056,10 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
                   </div>
                   <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
                     {(selectedApplicationRun?.events ?? runData?.events ?? []).slice(-6).map((event) => (
-                      <p key={event.id}>• {event.message || normalizeStepLabel(event.step)} ✓</p>
+                      <p key={event.id}>ΓÇó {event.message || normalizeStepLabel(event.step)} Γ£ô</p>
                     ))}
                     {((selectedApplicationRun?.events ?? runData?.events ?? []).length === 0) ? (
-                      <p>• Waiting for live automation events...</p>
+                      <p>ΓÇó Waiting for live automation events...</p>
                     ) : null}
                   </div>
                 </div>
@@ -1902,7 +2085,7 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
               {activePipelineIndex === 1 ? (
                 <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                   <p className="text-sm font-medium text-slate-900">Resume Preview</p>
-                  <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-5">
+                  <div className="mt-3 h-[540px] overflow-x-auto overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 p-5">
                     {hasUpgraded ? <div className="mb-2 text-xs text-blue-500">Resume optimized successfully</div> : null}
                     {resumePreviewState.showLoading ? (
                       <div className="animate-pulse space-y-2 rounded-md border border-slate-200 bg-white p-4">
@@ -1914,10 +2097,12 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
                       <div>
                         <p className="mb-3 text-xs font-medium uppercase tracking-wide text-slate-500">{resumePreviewState.resumeType}</p>
                         <StructuredResumePreview
-                          jobId={selectedApplicationItem?.id || applicationId || "resume-preview"}
                           canonical={resumePreviewState.canonicalData}
-                          originalResume={resumePreviewState.originalText}
+                          tailoringError={resumePreviewState.tailoringError}
+                          plainTextFallback={resumePreviewState.originalText}
                           missingSkills={missingSkills}
+                          matchedSkills={resumePreviewState.matchedSkills.length > 0 ? resumePreviewState.matchedSkills : matchedSkills}
+                          jdKeywords={resumePreviewState.jdKeywords}
                           userName={`${user.firstName} ${user.lastName}`}
                           email={user.email}
                           phone={profile.phone || ""}
@@ -1958,30 +2143,37 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
 
               {activePipelineIndex === 2 ? (
                 <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                  <p className="text-sm font-medium text-slate-900">Cover Letter Generation</p>
-                  <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-10 text-center text-sm text-slate-600">
-                    Generating cover letter...
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-medium text-slate-900">Cover Letter Preview</p>
+                    {aiCoverLetter ? (
+                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">AI · Tailored</span>
+                    ) : null}
+                  </div>
+                  <div className="mt-3 h-[540px] overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-5 text-sm leading-7 text-slate-800">
+                    {aiCoverLetter ? (
+                      <p className="whitespace-pre-wrap">{aiCoverLetter}</p>
+                    ) : (
+                      <p className="whitespace-pre-wrap text-slate-500">
+                        {generatedAnswers.find((item) => item.prompt.toLowerCase().includes("cover letter"))?.answer ||
+                          generatedAnswers.find((item) => item.prompt.toLowerCase().includes("why"))?.answer ||
+                          "Cover letter is being generated…"}
+                      </p>
+                    )}
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button type="button" variant="ghost" onClick={() => onEditProfile()}>Edit Profile</Button>
                   </div>
                 </div>
               ) : null}
 
               {activePipelineIndex === 3 ? (
-                <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                  <p className="text-sm font-medium text-slate-900">Cover Letter Preview</p>
-                  <div className="mt-3 h-[540px] overflow-auto rounded-lg border border-slate-200 bg-slate-50 p-5 text-sm leading-6 text-slate-700">
-                    <p className="whitespace-pre-wrap">{generatedAnswers.find((item) => item.prompt.toLowerCase().includes("why"))?.answer || "Cover letter draft pending..."}</p>
-                  </div>
-                </div>
-              ) : null}
-
-              {activePipelineIndex >= 4 ? (
                 <div className="relative">
                   <LiveAutomationPreview
                     jobUrl={selectedApplicationItem.jobUrl}
                     profile={profile}
                     generatedAnswers={generatedAnswers}
                   />
-                  {activePipelineIndex === 4 ? (
+                  {activePipelineIndex === 3 ? (
                     <div className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-xl bg-slate-900/35 px-4 text-center text-sm font-medium text-white">
                       Automation running. Pause to interact manually.
                     </div>
@@ -1989,17 +2181,17 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
                 </div>
               ) : null}
 
-              {activePipelineIndex >= 5 ? (
+              {activePipelineIndex >= 4 ? (
                 <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                   <p className="text-sm font-medium text-slate-900">Final Review & Submit</p>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
-                    Form is filled — review before submitting.
+                    Form is filled ΓÇö review before submitting.
                   </div>
                   <Button
                     type="button"
                     variant="default"
                     onClick={() => {
-                      promoteApplicationPipelineStage(selectedApplicationItem.id, 5);
+                      promoteApplicationPipelineStage(selectedApplicationItem.id, 4);
                       pushToast({ title: "Submit requested", description: "Final submit action is ready.", tone: "success" });
                     }}
                   >
@@ -2066,6 +2258,66 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
           Open Dashboard Jobs
         </Button>
       </div>
+    ) : activeItem === "Tracker" ? (
+      <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-semibold text-slate-900">Tracker</h2>
+            <p className="text-sm text-slate-500">Jobs that have been submitted or completed.</p>
+          </div>
+          <Button type="button" variant="default" onClick={() => void refreshApplications()}>
+            {applicationsRefreshing ? "Refreshing..." : "Refresh"}
+          </Button>
+        </div>
+
+        {trackerApplications.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-slate-300 px-4 py-10 text-center text-sm text-slate-500">
+            No submitted applications yet. Completed applications will appear here.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {trackerApplications.map((item) => {
+              const statusNormalized = item.status.toLowerCase();
+              const isSuccess = statusNormalized.includes("submitted") || statusNormalized.includes("completed") || statusNormalized.includes("success");
+              const isFailed = statusNormalized.includes("failed");
+              const isCancelled = statusNormalized.includes("cancelled");
+
+              return (
+                <article key={item.id} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-sm text-slate-500">{safeCompanyHost(item.jobUrl)}</p>
+                      <p className="text-lg font-semibold text-slate-900">{item.targetRole}</p>
+                      <p className="text-xs text-slate-500">{item.jobUrl}</p>
+                    </div>
+                    <div className="text-right space-y-1">
+                      <span
+                        className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                          isSuccess
+                            ? "bg-emerald-100 text-emerald-700"
+                            : isFailed
+                              ? "bg-rose-100 text-rose-700"
+                              : isCancelled
+                                ? "bg-slate-200 text-slate-600"
+                                : "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {item.status}
+                      </span>
+                      <p className="text-xs text-slate-500">{normalizeStepLabel(item.currentStep)}</p>
+                      <p className="text-xs text-slate-400">{new Date(item.updatedAt).toLocaleString()}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    <Button type="button" variant="ghost" onClick={() => window.open(item.jobUrl, "_blank", "noopener,noreferrer")}>Open Job</Button>
+                    <Button type="button" variant="default" onClick={() => void openApplicationRun(item)}>View Details</Button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </div>
     ) : (
       <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
         <h2 className="text-xl font-semibold text-slate-900">Settings</h2>
@@ -2094,9 +2346,10 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
         <DashboardSidebar
           userName={`${user.firstName} ${user.lastName}`}
           userEmail={user.email}
-          activeItem={activeItem === "ApplicationDetail" ? "Applications" : activeItem}
+          activeItem={activeItem === "ApplicationDetail" ? "Applications" : activeItem === "Tracker" ? "Tracker" : activeItem}
           onNavigateApply={() => setActiveItem("Apply")}
           onNavigateApplications={() => setActiveItem("Applications")}
+          onNavigateTracker={() => setActiveItem("Tracker")}
           onNavigateJobs={() => setActiveItem("Jobs")}
           onNavigateProfile={onEditProfile}
           onNavigateSettings={() => setActiveItem("Settings")}
@@ -2105,7 +2358,7 @@ function MainDashboardScreenInner({ user, profile, onEditProfile, onLogout }: Ma
       }
       leftRail={activeItem === "Apply" ? null : leftRail}
       main={activeItem === "Apply" ? jobsBoard : main}
-      hideLeftRail={activeItem === "ApplicationDetail" || activeItem === "Apply" || activeItem === "Applications"}
+      hideLeftRail={activeItem === "ApplicationDetail" || activeItem === "Apply" || activeItem === "Applications" || activeItem === "Tracker"}
     >
       <ApprovalModal
         open={approvalOpen}

@@ -2,7 +2,7 @@ import type { Job } from "bullmq";
 import { workerAdvanceStep, workerLogEvent, workerUpdateStep } from "../lib/apiClient.js";
 import { GeminiService } from "../lib/ai/geminiService.js";
 import { analyzeJob } from "../automation/tailor/jobAnalyzer.js";
-import { buildResumeCanonical, generatePDF, tailorResume, validateResumeCanonical } from "../automation/tailor/resumeTailor.js";
+import { buildResumeCanonical, isTailored, tailorResume, validateResumeCanonical } from "../automation/tailor/resumeTailor.js";
 import { type ResumeCanonical } from "../automation/tailor/types.js";
 
 const gemini = new GeminiService();
@@ -16,6 +16,7 @@ type ResumeDiff = {
 };
 
 function buildStructuredDiff(originalResumeText: string, canonical: ResumeCanonical): ResumeDiff[] {
+  void originalResumeText;
   return [
     {
       section: "summary",
@@ -26,8 +27,31 @@ function buildStructuredDiff(originalResumeText: string, canonical: ResumeCanoni
       section: "skills",
       added: canonical.skills,
       reason: "Injected relevant skills."
+    },
+    {
+      section: "experience",
+      added: canonical.experience.flatMap((entry) => entry.bullets),
+      reason: "Rewrote experience bullets with JD keywords."
     }
   ];
+}
+
+function dedupeKeywords(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  values.forEach((value) => {
+    const cleaned = value.trim();
+    if (!cleaned) return;
+
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+
+    seen.add(key);
+    output.push(cleaned);
+  });
+
+  return output;
 }
 
 export async function runAi(job: Job): Promise<void> {
@@ -84,100 +108,154 @@ export async function runAi(job: Job): Promise<void> {
 
     const jobInsights = (metadata?.jobInsights as { keywords?: string[]; skillGaps?: string[]; relevanceScore?: number } | undefined) ?? {};
     const heuristicScore = Math.round(Math.max(0, Math.min(1, jobInsights.relevanceScore ?? optimization.scoreAfter)) * 100);
-    
+
+    // Use the real scraped job description if available, otherwise build a synthetic one
+    const scrapedJobDescription = typeof metadata?.jobDescription === "string" && metadata.jobDescription.trim().length > 50
+      ? metadata.jobDescription.trim()
+      : null;
+
+    const syntheticJd = scrapedJobDescription ?? [
+      `Job Title: ${targetRole ?? "Unknown"}`,
+      `Target URL: ${jobUrl ?? "Unknown"}`,
+      `Keywords: ${(jobInsights.keywords ?? []).join(", ")}`,
+      `Required skills: ${(jobInsights.skillGaps ?? []).join(", ")}`,
+      `This role requires collaboration, production system ownership, and measurable delivery outcomes.`,
+    ].join("\n");
+
     let resumeCanonical: ResumeCanonical | null = null;
     let tailoringError: string | null = null;
-    const shouldTailor = heuristicScore >= AUTO_APPLY_THRESHOLD;
+    let requiredSkills: string[] = [];
+    let preferredSkills: string[] = [];
+    let extractedKeywords: string[] = [];
+    const shouldTailor = true;
 
-    if (shouldTailor) {
+    await workerLogEvent({
+      applicationId,
+      step: "resume_optimized",
+      message: "Tailoring triggered",
+      payloadJson: {
+        heuristicScore,
+        threshold: AUTO_APPLY_THRESHOLD,
+        tailoringTriggered: shouldTailor,
+        usedScrapedJd: Boolean(scrapedJobDescription),
+      }
+    });
+
+    try {
+      const jobProfile = await analyzeJob({ jobDescription: syntheticJd });
+
+      requiredSkills = dedupeKeywords([
+        ...jobProfile.skills,
+        ...(jobInsights.keywords ?? [])
+      ]).slice(0, 10);
+
+      preferredSkills = dedupeKeywords([
+        ...jobProfile.keywords,
+        ...(jobInsights.skillGaps ?? [])
+      ]).slice(0, 10);
+
+      extractedKeywords = dedupeKeywords([
+        ...requiredSkills,
+        ...preferredSkills
+      ]);
+
+      const canonical = await tailorResume({
+        originalResume,
+        jobDescription: syntheticJd,
+        requiredSkills,
+        preferredSkills
+      });
+
+      canonical.version = 1;
+      canonical.generatedFor = targetRole ?? jobProfile.role;
+      canonical.generatedAt = new Date().toISOString();
+
+      validateResumeCanonical(canonical, extractedKeywords);
+      if (!isTailored(canonical, syntheticJd)) {
+        throw new Error("Canonical resume is not JD-optimized");
+      }
+
+      const computed = buildResumeCanonical(canonical);
+      if (computed !== canonical.rawText) {
+        throw new Error("Canonical mismatch - blocking PDF generation");
+      }
+
+      resumeCanonical = canonical;
+
+      console.log({
+        tailoringTriggered: shouldTailor,
+        canonicalSkills: resumeCanonical.skills,
+        jdKeywords: extractedKeywords
+      });
+
       await workerLogEvent({
         applicationId,
         step: "resume_optimized",
-        message: "Tailoring triggered",
+        message: "Tailored canonical resume generated",
         payloadJson: {
-          heuristicScore,
-          threshold: AUTO_APPLY_THRESHOLD
+          diff: buildStructuredDiff(originalResume, resumeCanonical),
+          resumeCanonical,
+          originalResume,
+          version: resumeCanonical.version,
+          tailoringTriggered: shouldTailor,
+          fallbackUsed: false,
+          threshold: AUTO_APPLY_THRESHOLD,
+          scoreBefore: Math.round(optimization.scoreBefore * 100),
+          scoreAfter: heuristicScore,
+          requiredSkills,
+          preferredSkills,
+          jdKeywords: extractedKeywords,
+          canonicalReady: true
+        }
+      });
+    } catch (error) {
+      tailoringError = error instanceof Error ? error.message : String(error);
+      await workerLogEvent({
+        applicationId,
+        step: "resume_optimized",
+        message: "Tailoring failed - canonical not updated",
+        payloadJson: {
+          error: tailoringError,
+          tailoringError,
+          resumeCanonical: null,
+          originalResume,
+          version: 0,
+          tailoringTriggered: true,
+          fallbackUsed: true,
+          threshold: AUTO_APPLY_THRESHOLD,
+          scoreBefore: Math.round(optimization.scoreBefore * 100),
+          scoreAfter: heuristicScore,
+          requiredSkills,
+          preferredSkills,
+          jdKeywords: extractedKeywords,
+          canonicalReady: false
         }
       });
 
-      try {
-        const syntheticJd = [
-          `Role: ${targetRole ?? "Unknown"}`,
-          `Keywords: ${(jobInsights.keywords ?? []).join(", ")}`,
-          `Skill gaps: ${(jobInsights.skillGaps ?? []).join(", ")}`,
-        ].join("\n");
-
-        const jobProfile = await analyzeJob({ jobDescription: syntheticJd });
-        
-        // tailorResume already generates ResumeCanonical and enforces limits
-        resumeCanonical = await tailorResume({
-          baseResume: originalResume,
-          jobProfile
-        });
-        
-        resumeCanonical.version = 1;
-        resumeCanonical.generatedFor = targetRole ?? jobProfile.role;
-        resumeCanonical.generatedAt = new Date().toISOString();
-
-        validateResumeCanonical(resumeCanonical, [...jobProfile.skills, ...(jobInsights.keywords ?? [])]);
-        
-        // Verify canonical generation
-        const computed = buildResumeCanonical(resumeCanonical);
-        if (computed !== resumeCanonical.rawText) {
-          throw new Error("Canonical mismatch — blocking PDF generation");
-        }
-
-        await workerLogEvent({
-          applicationId,
-          step: "resume_optimized",
-          message: "Tailored resume generated",
-          payloadJson: {
-            diff: buildStructuredDiff(originalResume, resumeCanonical),
-            resumeCanonical,
+      await workerUpdateStep({
+        applicationId,
+        currentStep: "resume_optimized",
+        status: "failed",
+        checkpointJson: {
+          metadata: {
+            ...(metadata ?? {}),
             originalResume,
-            version: resumeCanonical.version,
-            tailoringTriggered: shouldTailor,
-            fallbackUsed: false,
-            threshold: AUTO_APPLY_THRESHOLD,
-            scoreBefore: Math.round(optimization.scoreBefore * 100),
-            scoreAfter: heuristicScore
-          }
-        });
-      } catch (error) {
-        tailoringError = error instanceof Error ? error.message : String(error);
-        await workerLogEvent({
-          applicationId,
-          step: "resume_optimized",
-          message: "Tailoring failed, falling back to original resume",
-          payloadJson: {
-            error: tailoringError,
-            tailoringError,
-            resumeCanonical: null, // Will use un-tailored via frontend/worker defaults
-            originalResume,
-            version: 0,
+            resumeCanonical: null,
+            resumeHistory: metadata?.resumeHistory ?? [],
+            resumeVersion: 0,
             tailoringTriggered: true,
-            fallbackUsed: true,
-            threshold: AUTO_APPLY_THRESHOLD,
-            scoreBefore: Math.round(optimization.scoreBefore * 100),
-            scoreAfter: heuristicScore
+            tailoringThreshold: AUTO_APPLY_THRESHOLD,
+            tailoringError,
+            fallbackUsed: false,
+            requiredSkills,
+            preferredSkills,
+            jdKeywords: extractedKeywords,
+            canonicalReady: false
           }
-        });
-      }
-    }
+        }
+      });
 
-    if (!shouldTailor || tailoringError) {
-      // Create a default un-tailored canonical object from the original resume
-      const rawLines = originalResume.split(/\r?\n/).filter(line => line.trim());
-      resumeCanonical = {
-        summary: rawLines.length > 0 ? rawLines[0] : "",
-        skills: [],
-        experience: [{ title: "Original Experience", bullets: rawLines.slice(1, 5) }],
-        rawText: originalResume,
-        keywordsInjected: [],
-        version: 0,
-        generatedFor: targetRole ?? "unknown",
-        generatedAt: new Date().toISOString()
-      };
+      throw new Error("Canonical resume is not JD-optimized");
     }
 
     // Add to resumeHistory
@@ -204,7 +282,11 @@ export async function runAi(job: Job): Promise<void> {
           tailoringTriggered: shouldTailor,
           tailoringThreshold: AUTO_APPLY_THRESHOLD,
           tailoringError,
-          fallbackUsed: Boolean(tailoringError)
+          fallbackUsed: false,
+          requiredSkills,
+          preferredSkills,
+          jdKeywords: extractedKeywords,
+          canonicalReady: true
         }
       }
     });
@@ -215,26 +297,52 @@ export async function runAi(job: Job): Promise<void> {
 
   if (step === "answers_generated") {
     console.log(`\n🧠 [aiWorker] step=answers_generated appId=${applicationId}`);
+
+    const jobInsights = (metadata?.jobInsights as { keywords?: string[]; skillGaps?: string[]; relevanceScore?: number } | undefined) ?? {};
+    const scrapedJobDescription = typeof metadata?.jobDescription === "string" && metadata.jobDescription.trim().length > 50
+      ? metadata.jobDescription.trim()
+      : null;
+    const syntheticJd = scrapedJobDescription ?? [
+      `Job Title: ${targetRole ?? "Unknown"}`,
+      `Target URL: ${jobUrl ?? "Unknown"}`,
+      `Keywords: ${(jobInsights.keywords ?? []).join(", ")}`,
+    ].join("\n");
+
+    const resumeCanonical = metadata?.resumeCanonical as {
+      summary?: string;
+      skills?: string[];
+      experience?: Array<{ title: string; bullets: string[] }>;
+      projects?: Array<{ title: string; bullets: string[] }>;
+    } | null | undefined;
+
     const generatedAnswers = await gemini.generateFormAnswers({
       targetRole,
+      jobDescription: syntheticJd,
       resumeText: originalResume,
+      resumeCanonical: resumeCanonical ?? null,
       profile,
-      keywords: ["typescript", "playwright", "redis", "postgresql"]
+      keywords: [
+        ...(jobInsights.keywords ?? []),
+        ...(jobInsights.skillGaps ?? []),
+      ].slice(0, 10),
     });
 
     const mergedAnswers = {
       ...generatedAnswers.answers,
-      ...customAnswers
+      "why-this-company": generatedAnswers.whyThisCompany || generatedAnswers.answers["why-this-company"] || "",
+      "years-experience": generatedAnswers.yearsExperience || generatedAnswers.answers["years-experience"] || "",
+      "cover-letter": generatedAnswers.coverLetter || "",
+      ...customAnswers,
     };
 
     await workerLogEvent({
       applicationId,
       step: "answers_generated",
-      message: "Form answers generated and consistency checked",
+      message: "Form answers and cover letter generated",
       payloadJson: {
-        checks: generatedAnswers.checks,
-        answers: mergedAnswers
-      }
+        coverLetter: generatedAnswers.coverLetter,
+        answers: mergedAnswers,
+      },
     });
 
     await workerUpdateStep({

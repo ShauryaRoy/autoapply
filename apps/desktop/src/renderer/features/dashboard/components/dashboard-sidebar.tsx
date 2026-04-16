@@ -1,4 +1,4 @@
-import { BriefcaseBusiness, ClipboardList, LayoutDashboard, Settings, UserRound } from "lucide-react";
+import { BriefcaseBusiness, ClipboardList, LayoutDashboard, ListChecks, Settings, UserRound } from "lucide-react";
 import { motion } from "framer-motion";
 import { Button } from "../../../components/ui/button.js";
 import { Card } from "../../../components/ui/card.js";
@@ -6,22 +6,24 @@ import { Card } from "../../../components/ui/card.js";
 type DashboardSidebarProps = {
   userName: string;
   userEmail: string;
-  activeItem?: "Apply" | "Applications" | "Jobs" | "Profile" | "Settings";
+  activeItem?: "Apply" | "Applications" | "Jobs" | "Profile" | "Settings" | "Tracker";
   onNavigateApply?: () => void;
   onNavigateApplications?: () => void;
   onNavigateJobs?: () => void;
   onNavigateProfile?: () => void;
   onNavigateSettings?: () => void;
+  onNavigateTracker?: () => void;
   onLogout: () => void;
 };
 
 const navItems: Array<{
-  key: "Apply" | "Applications" | "Jobs" | "Profile" | "Settings";
+  key: "Apply" | "Applications" | "Tracker" | "Jobs" | "Profile" | "Settings";
   label: string;
   icon: typeof LayoutDashboard;
 }> = [
   { key: "Apply", label: "Dashboard", icon: LayoutDashboard },
   { key: "Applications", label: "Applications", icon: ClipboardList },
+  { key: "Tracker", label: "Tracker", icon: ListChecks },
   { key: "Jobs", label: "Jobs", icon: BriefcaseBusiness },
   { key: "Profile", label: "Profile", icon: UserRound },
   { key: "Settings", label: "Settings", icon: Settings }
@@ -36,11 +38,13 @@ export function DashboardSidebar({
   onNavigateJobs,
   onNavigateProfile,
   onNavigateSettings,
+  onNavigateTracker,
   onLogout
 }: DashboardSidebarProps) {
-  const handleItemClick = (label: "Apply" | "Applications" | "Jobs" | "Profile" | "Settings") => {
+  const handleItemClick = (label: "Apply" | "Applications" | "Tracker" | "Jobs" | "Profile" | "Settings") => {
     if (label === "Apply") onNavigateApply?.();
     if (label === "Applications") onNavigateApplications?.();
+    if (label === "Tracker") onNavigateTracker?.();
     if (label === "Jobs") onNavigateJobs?.();
     if (label === "Profile") onNavigateProfile?.();
     if (label === "Settings") onNavigateSettings?.();

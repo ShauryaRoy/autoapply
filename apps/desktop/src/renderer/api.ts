@@ -139,6 +139,25 @@ export type LinkProfile = {
   other: string;
 };
 
+export type SalaryPreferences = {
+  expected?: string;
+  currency?: string;
+  openToNegotiation?: "yes" | "no" | "";
+};
+
+export type Availability = {
+  noticePeriod?: string;
+  earliestStartDate?: string;
+  currentlyEmployed?: "yes" | "no" | "";
+};
+
+export type WorkPreferences = {
+  mode?: string;
+  willingToRelocate?: "yes" | "no" | "";
+  travelPercent?: string;
+  inPersonPercent?: string;
+};
+
 export type UserProfile = {
   firstName: string;
   lastName: string;
@@ -158,7 +177,10 @@ export type UserProfile = {
   skills?: SkillEntry[];
   personal?: PersonalProfile;
   links?: LinkProfile;
-  answers?: Record<string, string>; // Unified answers for the form filler
+  salary?: SalaryPreferences;
+  availability?: Availability;
+  workPreferences?: WorkPreferences;
+  answers?: Record<string, string>;
 };
 
 const PROFILE_KEY = "autoapply_profile";
@@ -219,6 +241,20 @@ export async function createApplication(payload: {
 export async function getApplication(applicationId: string) {
   const response = await api.get(`/api/applications/${applicationId}`);
   return response.data;
+}
+
+export async function listApplications(limit = 30) {
+  const response = await api.get("/api/applications", {
+    params: { limit }
+  });
+  return response.data as Array<{
+    id: string;
+    jobUrl: string;
+    targetRole: string;
+    status: string;
+    currentStep: string;
+    updatedAt: string;
+  }>;
 }
 
 export async function getLatestPreview(applicationId: string): Promise<string | null> {

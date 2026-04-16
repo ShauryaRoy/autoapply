@@ -1,9 +1,4 @@
-import { Fragment, type ReactNode, useEffect, useMemo, useState } from "react";
-import {
-  parseResumeWithAI,
-  parsedResumeCache,
-  type ParsedResume
-} from "../../../utils/resumeParser.js";
+import { Fragment, type ReactNode } from "react";
 
 type ResumeCanonicalEntry = {
   title?: string;
@@ -25,42 +20,23 @@ export type StructuredResumeCanonical = {
   skills?: string[];
   experience?: ResumeCanonicalEntry[];
   projects?: ResumeCanonicalEntry[];
+  activities?: ResumeCanonicalEntry[];
   education?: ResumeCanonicalEducationEntry[];
   keywordsInjected?: string[];
 };
 
 type StructuredResumePreviewProps = {
-  jobId: string;
   canonical?: StructuredResumeCanonical;
-  originalResume: string;
+  tailoringError?: string;
+  fallbackUsed?: boolean;
+  plainTextFallback?: string;
   missingSkills: string[];
+  matchedSkills: string[];
+  jdKeywords: string[];
   userName: string;
   email: string;
   phone: string;
   links: string;
-};
-
-type ResumeEntry = {
-  title: string;
-  subtitle?: string;
-  bullets: string[];
-};
-
-type ResumeModel = {
-  name: string;
-  contact: string;
-  education: ResumeEntry[];
-  skills: string[];
-  experience: ResumeEntry[];
-};
-
-export type DiffToken = {
-  text: string;
-  type: "added" | "unchanged";
-};
-
-export type DiffMap = {
-  [path: string]: DiffToken[];
 };
 
 function normalizeList(values: string[] | undefined): string[] {
@@ -83,232 +59,73 @@ function normalizeList(values: string[] | undefined): string[] {
   return output;
 }
 
-function tokenizeWords(value: string): string[] {
-  return value
-    .trim()
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter(Boolean);
+function normalizeKey(value: string): string {
+  return value.trim().toLowerCase();
 }
 
-function buildWordDiff(originalValue: string, optimizedValue: string): DiffToken[] {
-  const originalWords = tokenizeWords(originalValue);
-  const optimizedWords = tokenizeWords(optimizedValue);
-
-  if (optimizedWords.length === 0) return [];
-
-  const n = originalWords.length;
-  const m = optimizedWords.length;
-
-  const dp: number[][] = Array.from({ length: n + 1 }, () => Array<number>(m + 1).fill(0));
-
-  for (let i = n - 1; i >= 0; i -= 1) {
-    for (let j = m - 1; j >= 0; j -= 1) {
-      if (originalWords[i] === optimizedWords[j]) {
-        dp[i][j] = 1 + dp[i + 1][j + 1];
-      } else {
-        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
-      }
-    }
-  }
-
-  const tokens: DiffToken[] = [];
-  let i = 0;
-  let j = 0;
-
-  while (j < m) {
-    if (i < n && originalWords[i] === optimizedWords[j]) {
-      tokens.push({ text: optimizedWords[j], type: "unchanged" });
-      i += 1;
-      j += 1;
-      continue;
-    }
-
-    if (i < n && dp[i + 1][j] >= dp[i][j + 1]) {
-      i += 1;
-      continue;
-    }
-
-    tokens.push({ text: optimizedWords[j], type: "added" });
-    j += 1;
-  }
-
-  return tokens;
-}
-
-function setDiffPath(diffMap: DiffMap, path: string, originalValue: string, optimizedValue: string): void {
-  diffMap[path] = buildWordDiff(originalValue, optimizedValue);
-}
-
-function buildDiffMap(originalResume: ResumeModel, optimizedResume: ResumeModel): DiffMap {
-  const diffMap: DiffMap = {};
-
-  setDiffPath(diffMap, "name", originalResume.name, optimizedResume.name);
-  setDiffPath(diffMap, "contact", originalResume.contact, optimizedResume.contact);
-  setDiffPath(diffMap, "skills", originalResume.skills.join(", "), optimizedResume.skills.join(", "));
-
-  const educationLength = Math.max(originalResume.education.length, optimizedResume.education.length);
-  for (let educationIndex = 0; educationIndex < educationLength; educationIndex += 1) {
-    const originalEntry = originalResume.education[educationIndex];
-    const optimizedEntry = optimizedResume.education[educationIndex];
-    if (!optimizedEntry) continue;
-
-    setDiffPath(diffMap, `education.${educationIndex}.title`, originalEntry?.title ?? "", optimizedEntry.title);
-    setDiffPath(diffMap, `education.${educationIndex}.subtitle`, originalEntry?.subtitle ?? "", optimizedEntry.subtitle ?? "");
-
-    const bulletCount = Math.max(originalEntry?.bullets.length ?? 0, optimizedEntry.bullets.length);
-    for (let bulletIndex = 0; bulletIndex < bulletCount; bulletIndex += 1) {
-      setDiffPath(
-        diffMap,
-        `education.${educationIndex}.bullets.${bulletIndex}`,
-        originalEntry?.bullets[bulletIndex] ?? "",
-        optimizedEntry.bullets[bulletIndex] ?? ""
-      );
-    }
-  }
-
-  const experienceLength = Math.max(originalResume.experience.length, optimizedResume.experience.length);
-  for (let experienceIndex = 0; experienceIndex < experienceLength; experienceIndex += 1) {
-    const originalEntry = originalResume.experience[experienceIndex];
-    const optimizedEntry = optimizedResume.experience[experienceIndex];
-    if (!optimizedEntry) continue;
-
-    setDiffPath(diffMap, `experience.${experienceIndex}.title`, originalEntry?.title ?? "", optimizedEntry.title);
-    setDiffPath(diffMap, `experience.${experienceIndex}.subtitle`, originalEntry?.subtitle ?? "", optimizedEntry.subtitle ?? "");
-
-    const bulletCount = Math.max(originalEntry?.bullets.length ?? 0, optimizedEntry.bullets.length);
-    for (let bulletIndex = 0; bulletIndex < bulletCount; bulletIndex += 1) {
-      setDiffPath(
-        diffMap,
-        `experience.${experienceIndex}.bullets.${bulletIndex}`,
-        originalEntry?.bullets[bulletIndex] ?? "",
-        optimizedEntry.bullets[bulletIndex] ?? ""
-      );
-    }
-  }
-
-  return diffMap;
-}
-
-function canonicalEntryToEntry(entry: ResumeCanonicalEntry, fallbackTitle: string): ResumeEntry {
-  const title =
-    entry.title?.trim() ||
-    [entry.role?.trim(), entry.company?.trim() || entry.organization?.trim()].filter(Boolean).join(" | ") ||
-    fallbackTitle;
-
-  return {
-    title,
-    bullets: normalizeList(entry.bullets)
-  };
-}
-
-function canonicalEducationToEntry(entry: ResumeCanonicalEducationEntry): ResumeEntry {
-  return {
-    title: entry.title?.trim() || entry.school?.trim() || entry.institution?.trim() || "Education",
-    bullets: normalizeList(entry.details)
-  };
-}
-
-function hasCanonicalContent(canonical: StructuredResumeCanonical | undefined): boolean {
-  if (!canonical) return false;
-
-  return Boolean(
-    canonical.skills?.length ||
-      canonical.education?.length ||
-      canonical.experience?.length ||
-      canonical.projects?.length ||
-      canonical.summary?.trim()
-  );
-}
-
-function isValidParsedResume(data: ParsedResume | null): data is ParsedResume {
-  return Boolean(
-    data &&
-    Array.isArray(data.experience) &&
-    Array.isArray(data.projects) &&
-    (data.experience.length > 0 || data.projects.length > 0)
-  );
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildContactLine(parts: string[]): string {
   return parts.map((part) => part.trim()).filter(Boolean).join(" | ");
 }
 
-function toResumeFromCanonical(canonical: StructuredResumeCanonical, fallbackName: string, fallbackContact: string): ResumeModel {
-  const experience = [
-    ...(canonical.experience ?? []).map((entry) => canonicalEntryToEntry(entry, "Unknown Role")),
-    ...(canonical.projects ?? []).map((entry) => ({
-      ...canonicalEntryToEntry(entry, "Project"),
-      subtitle: "Project"
-    }))
-  ];
+function isValidCanonical(canonical: StructuredResumeCanonical | undefined): canonical is StructuredResumeCanonical {
+  if (!canonical) return false;
 
-  return {
-    name: fallbackName || "Resume",
-    contact: fallbackContact,
-    education: (canonical.education ?? []).map(canonicalEducationToEntry),
-    skills: normalizeList(canonical.skills),
-    experience
-  };
+  const hasSummary = Boolean(canonical.summary?.trim());
+  const hasSkills = (canonical.skills?.length ?? 0) > 0;
+  const hasExperience = (canonical.experience?.length ?? 0) > 0;
+  const hasProjects = (canonical.projects?.length ?? 0) > 0;
+  const hasActivities = (canonical.activities?.length ?? 0) > 0;
+
+  return hasSummary && hasSkills && (hasExperience || hasProjects || hasActivities);
 }
 
-function toResumeFromParsed(parsedResume: ParsedResume, fallbackName: string, fallbackContact: string): ResumeModel {
-  const contactParts = [
-    parsedResume.header.email,
-    parsedResume.header.phone,
-    ...(parsedResume.header.links ?? [])
-  ].filter((value): value is string => Boolean(value && value.trim()));
-
-  const parsedContact = contactParts.length > 0 ? contactParts.join(" | ") : fallbackContact;
-
-  const education = parsedResume.education.map((entry) => {
-    const title = [entry.degree, entry.institution, entry.duration].filter(Boolean).join(" | ") || "Education";
-    return {
-      title,
-      bullets: normalizeList(entry.details)
-    };
-  });
-
-  const normalizedSkills = normalizeList(parsedResume.skills.flatMap((entry) => entry.items));
-
-  const experience: ResumeEntry[] = [
-    ...parsedResume.experience.map((entry) => ({
-      title: entry.role,
-      subtitle: [entry.company, entry.duration].filter(Boolean).join(" | ") || undefined,
-      bullets: normalizeList(entry.bullets)
-    })),
-    ...parsedResume.projects.map((entry) => ({
-      title: entry.title,
-      subtitle: "Project",
-      bullets: normalizeList(entry.bullets)
-    }))
-  ];
-
-  return {
-    name: parsedResume.header.name || fallbackName || "Resume",
-    contact: parsedContact,
-    education,
-    skills: normalizedSkills,
-    experience
-  };
+function resolveEntryTitle(entry: ResumeCanonicalEntry, fallback: string): string {
+  return (
+    entry.title?.trim() ||
+    [entry.role?.trim(), entry.company?.trim() || entry.organization?.trim()].filter(Boolean).join(" | ") ||
+    fallback
+  );
 }
 
-export function InlineText({ tokens }: { tokens: DiffToken[] }) {
-  if (tokens.length === 0) return null;
+function KeywordHighlightedText({
+  text,
+  keywords
+}: {
+  text: string;
+  keywords: string[];
+}) {
+  const cleanedKeywords = normalizeList(keywords).sort((a, b) => b.length - a.length);
+  if (!text || cleanedKeywords.length === 0) {
+    return <>{text}</>;
+  }
+
+  const pattern = new RegExp(`(${cleanedKeywords.map(escapeRegex).join("|")})`, "gi");
+  const parts = text.split(pattern);
+  const keySet = new Set(cleanedKeywords.map((keyword) => keyword.toLowerCase()));
 
   return (
     <>
-      {tokens.map((token, index) => (
-        <Fragment key={`${token.text}-${index}`}>
-          <span className={token.type === "added" ? "bg-green-100 text-green-800" : ""}>{token.text}</span>
-          {index < tokens.length - 1 ? " " : null}
-        </Fragment>
-      ))}
+      {parts.map((part, index) => {
+        const isKeyword = keySet.has(part.toLowerCase());
+        if (!isKeyword) {
+          return <Fragment key={`plain-${index}`}>{part}</Fragment>;
+        }
+
+        return (
+          <mark key={`hit-${index}`} className="rounded bg-amber-100 px-1 text-amber-900">
+            {part}
+          </mark>
+        );
+      })}
     </>
   );
 }
 
-export function Section({ title, children }: { title: string; children: ReactNode }) {
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="mt-4">
       <h3 className="border-b border-slate-300 pb-1 text-[11px] font-bold uppercase tracking-[0.12em] text-slate-700">{title}</h3>
@@ -317,42 +134,11 @@ export function Section({ title, children }: { title: string; children: ReactNod
   );
 }
 
-export function EntryBlock(props: {
-  entry: ResumeEntry;
-  pathPrefix: string;
-  diffMap: DiffMap;
-}) {
-  const { entry, pathPrefix, diffMap } = props;
-
-  return (
-    <article className="mb-2.5">
-      <p className="text-[12px] font-semibold text-slate-900">
-        <InlineText tokens={diffMap[`${pathPrefix}.title`] ?? buildWordDiff("", entry.title)} />
-      </p>
-      {entry.subtitle ? (
-        <p className="text-[11px] text-slate-500">
-          <InlineText tokens={diffMap[`${pathPrefix}.subtitle`] ?? buildWordDiff("", entry.subtitle)} />
-        </p>
-      ) : null}
-      {entry.bullets.length > 0 ? (
-        <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
-          {entry.bullets.map((bullet, bulletIndex) => (
-            <li key={`${pathPrefix}-bullet-${bulletIndex}`} className="mb-0.5">
-              <InlineText tokens={diffMap[`${pathPrefix}.bullets.${bulletIndex}`] ?? buildWordDiff("", bullet)} />
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </article>
-  );
-}
-
 function ViewerShell({ children }: { children: ReactNode }) {
   return (
     <div className="w-full bg-slate-100 px-4 py-4">
-      <div className="ml-auto w-full max-w-[880px]">
-        <Toolbar />
-        <div className="mt-3 flex justify-end overflow-auto">
+      <div className="w-max min-w-full">
+        <div className="mt-3 flex justify-start">
           <div className="w-[840px] bg-white p-10 shadow-sm">{children}</div>
         </div>
       </div>
@@ -360,394 +146,306 @@ function ViewerShell({ children }: { children: ReactNode }) {
   );
 }
 
-function ParsedExperienceEntry({
-  title,
-  company,
-  duration,
-  bullets,
-  tech
-}: {
-  title: string;
-  company?: string;
-  duration?: string;
-  bullets: string[];
-  tech?: string[];
-}) {
-  return (
-    <article className="mb-2.5">
-      <p className="text-[12px] font-semibold text-slate-900">{title}</p>
-      {(company || duration) ? (
-        <p className="text-[11px] text-slate-500">{[company, duration].filter(Boolean).join(" | ")}</p>
-      ) : null}
-      {bullets.length > 0 ? (
-        <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
-          {bullets.map((bullet, index) => (
-            <li key={`${title}-bullet-${index}`} className="mb-0.5">{bullet}</li>
-          ))}
-        </ul>
-      ) : null}
-      {tech && tech.length > 0 ? (
-        <p className="mt-1 text-[11px] text-slate-600">
-          <span className="font-semibold text-slate-700">Tech:</span> {tech.join(", ")}
-        </p>
-      ) : null}
-    </article>
-  );
-}
-
-function CanonicalResumeDocument({ optimizedResume, diffMap }: { optimizedResume: ResumeModel; diffMap: DiffMap }) {
-  const hasStructuredSections =
-    optimizedResume.education.length > 0 ||
-    optimizedResume.skills.length > 0 ||
-    optimizedResume.experience.length > 0;
-
-  return (
-    <article className="text-[11px] leading-[1.4] text-slate-800">
-      <header className="mb-4 text-center">
-        <h2 className="text-[22px] font-semibold text-slate-900">
-          <InlineText tokens={diffMap.name ?? buildWordDiff("", optimizedResume.name)} />
-        </h2>
-        {optimizedResume.contact ? (
-          <p className="mt-0.5 text-[11px] text-slate-500">
-            <InlineText tokens={diffMap.contact ?? buildWordDiff("", optimizedResume.contact)} />
-          </p>
-        ) : null}
-      </header>
-
-      {optimizedResume.education.length > 0 ? (
-        <Section title="Education">
-          {optimizedResume.education.map((entry, index) => (
-            <EntryBlock key={`education-${index}`} entry={entry} pathPrefix={`education.${index}`} diffMap={diffMap} />
-          ))}
-        </Section>
-      ) : null}
-
-      {optimizedResume.skills.length > 0 ? (
-        <Section title="Skills">
-          <p className="text-[11px] text-slate-700">
-            <InlineText tokens={diffMap.skills ?? buildWordDiff("", optimizedResume.skills.join(", "))} />
-          </p>
-        </Section>
-      ) : null}
-
-      {optimizedResume.experience.length > 0 ? (
-        <Section title="Experience">
-          {optimizedResume.experience.map((entry, index) => (
-            <EntryBlock key={`experience-${index}`} entry={entry} pathPrefix={`experience.${index}`} diffMap={diffMap} />
-          ))}
-        </Section>
-      ) : null}
-
-      {!hasStructuredSections ? (
-        <Section title="Resume">
-          <p className="text-[11px] text-slate-600">No structured sections are available yet.</p>
-        </Section>
-      ) : null}
-    </article>
-  );
-}
-
-function ParsedResumeDocument({
-  parsedResume
-}: {
-  parsedResume: ParsedResume;
-}) {
-  const displayName = parsedResume.header.name || "Resume";
-  const displayContact = [
-    parsedResume.header.email,
-    parsedResume.header.phone,
-    ...(parsedResume.header.links ?? [])
-  ]
-    .filter((value): value is string => Boolean(value && value.trim()))
-    .join(" | ");
-
-  return (
-    <article className="text-[11px] leading-[1.4] text-slate-800">
-      <header className="mb-4 text-center">
-        <h2 className="text-[22px] font-semibold text-slate-900">{displayName}</h2>
-        {displayContact ? <p className="mt-0.5 text-[11px] text-slate-500">{displayContact}</p> : null}
-      </header>
-
-      {parsedResume.education.length > 0 ? (
-        <Section title="Education">
-          <div className="space-y-2">
-            {parsedResume.education.map((entry, index) => (
-              <article key={`education-entry-${index}`}>
-                <p className="text-[12px] font-semibold text-slate-900">
-                  {[entry.degree, entry.institution].filter(Boolean).join(" | ") || "Education"}
-                </p>
-                {entry.duration ? <p className="text-[11px] text-slate-500">{entry.duration}</p> : null}
-                {entry.details?.length ? (
-                  <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
-                    {entry.details.map((detail, detailIndex) => (
-                      <li key={`education-detail-${index}-${detailIndex}`} className="mb-0.5">{detail}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </article>
-            ))}
-          </div>
-        </Section>
-      ) : null}
-
-      {parsedResume.skills.length > 0 ? (
-        <Section title="Skills">
-          <div className="space-y-1.5">
-            {parsedResume.skills.map((entry, index) => (
-              <p key={`skills-entry-${index}`} className="text-[11px] text-slate-700">
-                {entry.category ? <span className="font-semibold text-slate-800">{entry.category}: </span> : null}
-                {entry.items.join(", ")}
-              </p>
-            ))}
-          </div>
-        </Section>
-      ) : null}
-
-      {parsedResume.experience.length > 0 ? (
-        <Section title="Experience">
-          {parsedResume.experience.map((entry, index) => (
-            <ParsedExperienceEntry
-              key={`parsed-experience-${index}`}
-              title={entry.role}
-              company={entry.company}
-              duration={entry.duration}
-              bullets={entry.bullets}
-              tech={entry.tech}
-            />
-          ))}
-        </Section>
-      ) : null}
-
-      {parsedResume.projects.length > 0 ? (
-        <Section title="Projects">
-          {parsedResume.projects.map((entry, index) => (
-            <ParsedExperienceEntry
-              key={`parsed-project-${index}`}
-              title={entry.title}
-              bullets={entry.bullets}
-              tech={entry.tech}
-            />
-          ))}
-        </Section>
-      ) : null}
-
-      {parsedResume.activities.length > 0 ? (
-        <Section title="Activities">
-          <div className="space-y-2">
-            {parsedResume.activities.map((entry, index) => (
-              <article key={`activity-entry-${index}`}>
-                <p className="text-[12px] font-semibold text-slate-900">{entry.title || "Activity"}</p>
-                {entry.bullets.length > 0 ? (
-                  <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
-                    {entry.bullets.map((bullet, bulletIndex) => (
-                      <li key={`activity-bullet-${index}-${bulletIndex}`} className="mb-0.5">{bullet}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </article>
-            ))}
-          </div>
-        </Section>
-      ) : null}
-    </article>
-  );
-}
-
-export function Toolbar() {
-  return (
-    <div className="flex items-center justify-end gap-2">
-      <button type="button" className="h-7 w-7 border border-slate-300 bg-white text-[11px] text-slate-700" aria-label="Zoom in">
-        A+
-      </button>
-      <button type="button" className="h-7 w-7 border border-slate-300 bg-white text-[11px] text-slate-700" aria-label="Zoom out">
-        A-
-      </button>
-      <span className="px-1 text-[11px] text-slate-600">1 pg</span>
-      <button type="button" className="h-7 w-7 border border-slate-300 bg-white text-[11px] text-slate-700" aria-label="Edit">
-        ✎
-      </button>
-    </div>
-  );
-}
-
-function CanonicalResumeView({ optimizedResume, diffMap }: { optimizedResume: ResumeModel; diffMap: DiffMap }) {
+function GeneratingView() {
   return (
     <ViewerShell>
-      <CanonicalResumeDocument optimizedResume={optimizedResume} diffMap={diffMap} />
-    </ViewerShell>
-  );
-}
-
-function ParsedResumeView({ data }: { data: ParsedResume }) {
-  return (
-    <ViewerShell>
-      <ParsedResumeDocument parsedResume={data} />
-    </ViewerShell>
-  );
-}
-
-function ParseStatusViewer({
-  status
-}: {
-  status: "parsing" | "retrying" | "failed";
-}) {
-  const message =
-    status === "parsing"
-      ? "Parsing resume..."
-      : status === "retrying"
-        ? "Failed to parse resume. Retrying parsing..."
-        : "Failed to parse resume";
-
-  const textClass = status === "parsing" ? "text-slate-600" : "text-red-500";
-
-  return (
-    <ViewerShell>
-      <section className={`rounded-md border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm ${textClass}`}>
-        {message}
+      <section className="rounded-md border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm text-slate-600">
+        <p>Generating optimized resume...</p>
+        <div className="mt-3 flex items-center justify-center gap-2">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-slate-400" />
+          <span className="h-2 w-2 animate-pulse rounded-full bg-slate-500 [animation-delay:120ms]" />
+          <span className="h-2 w-2 animate-pulse rounded-full bg-slate-600 [animation-delay:240ms]" />
+        </div>
       </section>
     </ViewerShell>
   );
 }
 
+const PLAIN_SECTION_HEADERS = new Set([
+  "summary", "professional summary", "career summary", "profile", "objective",
+  "experience", "work experience", "professional experience", "employment", "employment history",
+  "projects", "project experience", "personal projects",
+  "skills", "technical skills", "core skills", "competencies", "technologies", "tech stack",
+  "education", "academic background",
+  "activities", "volunteer", "certifications", "awards", "achievements",
+]);
+
+function parsePlainTextResume(text: string): Array<{ type: "header" | "section" | "entry" | "bullet" | "blank"; text: string }> {
+  const lines = text.split(/\r?\n/);
+  const result: Array<{ type: "header" | "section" | "entry" | "bullet" | "blank"; text: string }> = [];
+  let lineIndex = 0;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) {
+      result.push({ type: "blank", text: "" });
+      lineIndex += 1;
+      continue;
+    }
+
+    const lower = line.toLowerCase().replace(/[:\-|]+$/, "").trim();
+    if (PLAIN_SECTION_HEADERS.has(lower) && line.length < 60) {
+      result.push({ type: "section", text: line });
+    } else if (/^[-•·*▪]/.test(line)) {
+      result.push({ type: "bullet", text: line.replace(/^[-•·*▪]\s*/, "") });
+    } else if (lineIndex < 5) {
+      result.push({ type: "header", text: line });
+    } else {
+      result.push({ type: "entry", text: line });
+    }
+
+    lineIndex += 1;
+  }
+
+  return result;
+}
+
+function PlainTextResumeView({ text, userName }: { text: string; userName: string }) {
+  const parsed = parsePlainTextResume(text);
+  const hasAnyContent = text.trim().length > 0;
+
+  if (!hasAnyContent) {
+    return <GeneratingView />;
+  }
+
+  return (
+    <ViewerShell>
+      <article className="text-[11px] leading-[1.5] text-slate-800">
+        <header className="mb-4 border-b border-slate-200 pb-3">
+          <h2 className="text-[20px] font-semibold text-slate-900">{userName || "Resume"}</h2>
+          <p className="mt-1 text-[10px] font-medium uppercase tracking-wide text-slate-500">
+            Original — Optimization in progress
+          </p>
+        </header>
+
+        <div className="space-y-0.5">
+          {parsed.map((item, idx) => {
+            if (item.type === "blank") {
+              return <div key={idx} className="h-2" />;
+            }
+            if (item.type === "section") {
+              return (
+                <h3 key={idx} className="mt-4 border-b border-slate-300 pb-1 text-[11px] font-bold uppercase tracking-[0.12em] text-slate-700">
+                  {item.text}
+                </h3>
+              );
+            }
+            if (item.type === "header") {
+              return (
+                <p key={idx} className="text-[11px] text-slate-500">{item.text}</p>
+              );
+            }
+            if (item.type === "bullet") {
+              return (
+                <p key={idx} className="ml-4 text-[11px] text-slate-700 before:mr-1.5 before:content-['•']">{item.text}</p>
+              );
+            }
+            return (
+              <p key={idx} className="text-[11px] text-slate-800">{item.text}</p>
+            );
+          })}
+        </div>
+      </article>
+    </ViewerShell>
+  );
+}
+
+function TailoringFailedView({ errorMessage }: { errorMessage: string }) {
+  return (
+    <ViewerShell>
+      <section className="rounded-md border border-rose-200 bg-rose-50 px-4 py-6 text-center text-sm text-rose-700">
+        <p className="font-medium">Tailoring failed</p>
+        <p className="mt-1 text-xs text-rose-600">{errorMessage}</p>
+      </section>
+    </ViewerShell>
+  );
+}
+
+function EntryList({
+  entries,
+  keywordHighlights,
+  fallbackTitle
+}: {
+  entries: ResumeCanonicalEntry[];
+  keywordHighlights: string[];
+  fallbackTitle: string;
+}) {
+  return (
+    <div className="space-y-3">
+      {entries.map((entry, index) => {
+        const title = resolveEntryTitle(entry, fallbackTitle);
+        const bullets = normalizeList(entry.bullets);
+        return (
+          <article key={`${fallbackTitle}-${index}`}>
+            <p className="text-[12px] font-semibold text-slate-900">{title}</p>
+            {bullets.length > 0 ? (
+              <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
+                {bullets.map((bullet, bulletIndex) => (
+                  <li key={`${fallbackTitle}-${index}-${bulletIndex}`} className="mb-0.5">
+                    <KeywordHighlightedText text={bullet} keywords={keywordHighlights} />
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
 export function StructuredResumePreview(props: StructuredResumePreviewProps) {
-  const { jobId, canonical, originalResume, userName, email, phone, links } = props;
-  void props.missingSkills;
+  const {
+    canonical,
+    tailoringError,
+    plainTextFallback,
+    missingSkills,
+    matchedSkills,
+    jdKeywords,
+    userName,
+    email,
+    phone,
+    links
+  } = props;
+
+  if (!isValidCanonical(canonical)) {
+    if (tailoringError) {
+      return <TailoringFailedView errorMessage={tailoringError} />;
+    }
+
+    // Show original resume text while optimization is in progress
+    if (plainTextFallback && plainTextFallback.trim().length > 0) {
+      return <PlainTextResumeView text={plainTextFallback} userName={userName} />;
+    }
+
+    return <GeneratingView />;
+  }
 
   const contactLine = buildContactLine([email, phone, links]);
-  const canonicalAvailable = hasCanonicalContent(canonical);
-  const resumeText = originalResume.trim();
-  const cacheKey = jobId.trim() || "default";
+  const canonicalSkills = normalizeList(canonical.skills);
+  const jdKeywordList = normalizeList(jdKeywords);
+  const missingSkillsSet = new Set(normalizeList(missingSkills).map(normalizeKey));
+  const injectedSet = new Set(normalizeList(canonical.keywordsInjected).map(normalizeKey));
+  const jdSet = new Set(jdKeywordList.map(normalizeKey));
 
-  const [parsedResume, setParsedResume] = useState<ParsedResume | null>(null);
-  const [parseStatus, setParseStatus] = useState<"parsing" | "retrying" | "failed">("parsing");
+  const matchedFromCanonical = canonicalSkills.filter((skill) => jdSet.has(normalizeKey(skill)));
+  const effectiveMatchedSkills = normalizeList([
+    ...matchedSkills,
+    ...matchedFromCanonical
+  ]);
 
-  useEffect(() => {
-    setParsedResume(null);
-    setParseStatus("parsing");
-  }, [cacheKey, resumeText]);
+  return (
+    <ViewerShell>
+      <article className="text-[11px] leading-[1.4] text-slate-800">
+        <header className="mb-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-[22px] font-semibold text-slate-900">{userName || "Resume"}</h2>
+              {contactLine ? <p className="mt-0.5 text-[11px] text-slate-500">{contactLine}</p> : null}
+            </div>
+            <span className="rounded-full border border-emerald-300 bg-emerald-50 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+              Optimized for this job
+            </span>
+          </div>
 
-  useEffect(() => {
-    if (canonicalAvailable) {
-      return;
-    }
+          {effectiveMatchedSkills.length > 0 ? (
+            <p className="mt-2 text-[11px] text-slate-700">
+              <span className="font-semibold text-slate-900">Matched Skills:</span> {effectiveMatchedSkills.join(", ")}
+            </p>
+          ) : null}
+        </header>
 
-    if (!resumeText) {
-      setParsedResume(null);
-      setParseStatus("parsing");
-      return;
-    }
+        {canonical.summary?.trim() ? (
+          <Section title="Summary">
+            <p className="text-[11px] text-slate-700">
+              <KeywordHighlightedText text={canonical.summary.trim()} keywords={jdKeywordList} />
+            </p>
+          </Section>
+        ) : null}
 
-    if (parsedResume && isValidParsedResume(parsedResume)) {
-      return;
-    }
+        {canonicalSkills.length > 0 ? (
+          <Section title="Skills">
+            <div className="flex flex-wrap gap-1.5">
+              {canonicalSkills.map((skill) => {
+                const key = normalizeKey(skill);
+                const isInjected = injectedSet.has(key);
+                const isMatched = jdSet.has(key);
+                const isMissing = missingSkillsSet.has(key);
 
-    const cached = parsedResumeCache[cacheKey];
-    if (cached && isValidParsedResume(cached)) {
-      setParsedResume(cached);
-      return;
-    }
+                const className = isInjected
+                  ? "border-amber-300 bg-amber-50 text-amber-800"
+                  : isMatched
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-800"
+                    : isMissing
+                      ? "border-rose-300 bg-rose-50 text-rose-700"
+                      : "border-slate-300 bg-slate-50 text-slate-700";
 
-    if (cached && !isValidParsedResume(cached)) {
-      delete parsedResumeCache[cacheKey];
-    }
+                return (
+                  <span key={skill} className={`rounded-full border px-2 py-0.5 text-[10px] ${className}`}>
+                    {skill}
+                    {isInjected ? " (Injected)" : ""}
+                  </span>
+                );
+              })}
+            </div>
+          </Section>
+        ) : null}
 
-    let cancelled = false;
+        {(canonical.experience?.length ?? 0) > 0 ? (
+          <Section title="Experience">
+            <EntryList
+              entries={canonical.experience ?? []}
+              keywordHighlights={jdKeywordList}
+              fallbackTitle="Experience"
+            />
+          </Section>
+        ) : null}
 
-    const parseResume = async () => {
-      setParseStatus("parsing");
-      let parsed = await parseResumeWithAI(originalResume, cacheKey);
-      if (cancelled) return;
+        {(canonical.projects?.length ?? 0) > 0 ? (
+          <Section title="Projects">
+            <EntryList
+              entries={canonical.projects ?? []}
+              keywordHighlights={jdKeywordList}
+              fallbackTitle="Project"
+            />
+          </Section>
+        ) : null}
 
-      console.log("AI PARSED RESULT:", parsed);
+        {(canonical.activities?.length ?? 0) > 0 ? (
+          <Section title="Activities">
+            <EntryList
+              entries={canonical.activities ?? []}
+              keywordHighlights={jdKeywordList}
+              fallbackTitle="Activity"
+            />
+          </Section>
+        ) : null}
 
-      if (!isValidParsedResume(parsed)) {
-        console.warn("Invalid parsed resume, retrying...");
-        delete parsedResumeCache[cacheKey];
-        setParseStatus("retrying");
-
-        parsed = await parseResumeWithAI(originalResume);
-        if (cancelled) return;
-
-        console.log("AI PARSED RESULT:", parsed);
-      }
-
-      if (!isValidParsedResume(parsed)) {
-        delete parsedResumeCache[cacheKey];
-        setParsedResume(null);
-        setParseStatus("failed");
-        return;
-      }
-
-      parsedResumeCache[cacheKey] = parsed;
-      setParsedResume(parsed);
-      setParseStatus("parsing");
-    };
-
-    void parseResume().catch((error) => {
-      if (cancelled) return;
-
-      console.error("AI PARSE FAILED:", error);
-      setParsedResume(null);
-      setParseStatus("failed");
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [canonicalAvailable, cacheKey, originalResume, parsedResume, resumeText]);
-
-  useEffect(() => {
-    const validParsed = isValidParsedResume(parsedResume);
-    console.log({
-      hasCanonical: !!canonicalAvailable,
-      hasParsed: !!parsedResume,
-      validParsed
-    });
-  }, [canonicalAvailable, parsedResume]);
-
-  const originalStructuredResume = useMemo(() => {
-    if (isValidParsedResume(parsedResume)) {
-      return toResumeFromParsed(parsedResume, userName || "Resume", contactLine);
-    }
-
-    return {
-      name: userName || "Resume",
-      contact: contactLine,
-      education: [],
-      skills: [],
-      experience: []
-    } satisfies ResumeModel;
-  }, [parsedResume, userName, contactLine]);
-
-  const optimizedResume = useMemo(() => {
-    if (!canonicalAvailable) {
-      return originalStructuredResume;
-    }
-
-    return toResumeFromCanonical(
-      canonical as StructuredResumeCanonical,
-      userName || originalStructuredResume.name,
-      contactLine || originalStructuredResume.contact
-    );
-  }, [canonical, canonicalAvailable, contactLine, originalStructuredResume, userName]);
-
-  const diffMap = useMemo(() => buildDiffMap(originalStructuredResume, optimizedResume), [optimizedResume, originalStructuredResume]);
-
-  if (canonicalAvailable) {
-    return <CanonicalResumeView optimizedResume={optimizedResume} diffMap={diffMap} />;
-  }
-
-  if (parsedResume && isValidParsedResume(parsedResume)) {
-    return <ParsedResumeView data={parsedResume} />;
-  }
-
-  if (parseStatus === "retrying") {
-    return <ParseStatusViewer status="retrying" />;
-  }
-
-  if (parseStatus === "failed") {
-    return <ParseStatusViewer status="failed" />;
-  }
-
-  return <ParseStatusViewer status="parsing" />;
+        {(canonical.education?.length ?? 0) > 0 ? (
+          <Section title="Education">
+            <div className="space-y-3">
+              {(canonical.education ?? []).map((entry, index) => {
+                const title = entry.title?.trim() || entry.school?.trim() || entry.institution?.trim() || "Education";
+                const details = normalizeList(entry.details);
+                return (
+                  <article key={`education-${index}`}>
+                    <p className="text-[12px] font-semibold text-slate-900">{title}</p>
+                    {details.length > 0 ? (
+                      <ul className="mt-1 list-disc pl-4 text-[11px] leading-[1.4] text-slate-700">
+                        {details.map((detail, detailIndex) => (
+                          <li key={`education-${index}-${detailIndex}`}>
+                            <KeywordHighlightedText text={detail} keywords={jdKeywordList} />
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
+          </Section>
+        ) : null}
+      </article>
+    </ViewerShell>
+  );
 }

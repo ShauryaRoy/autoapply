@@ -50,6 +50,42 @@ function buildWorkerMetadata(profile: Awaited<ReturnType<typeof getProfileByUser
         linkedin: profile.links?.linkedin || profile.linkedIn || null,
         portfolio: profile.links?.portfolio || profile.portfolio || null,
         github: profile.links?.github || null
+      },
+      workAuth: {
+        usAuthorized: profile.workAuth?.usAuthorized ?? "",
+        canadaAuthorized: profile.workAuth?.canadaAuthorized ?? "",
+        ukAuthorized: profile.workAuth?.ukAuthorized ?? "",
+        needsVisaSponsorship: profile.workAuth?.needsVisaSponsorship ?? ""
+      },
+      roles: {
+        desiredRoles: profile.roles?.desiredRoles ?? [],
+        preferredLocations: profile.roles?.preferredLocations ?? [],
+        employmentTypes: profile.roles?.employmentTypes ?? []
+      },
+      eeo: {
+        gender: profile.eeo?.gender ?? "",
+        veteran: profile.eeo?.veteran ?? "",
+        disability: profile.eeo?.disability ?? "",
+        lgbtq: profile.eeo?.lgbtq ?? "",
+        ethnicities: profile.eeo?.ethnicities ?? [],
+        declineEthnicity: profile.eeo?.declineEthnicity ?? false
+      },
+      yearsExperience: profile.yearsExperience ?? "",
+      salary: {
+        expected: profile.salary?.expected ?? "",
+        currency: profile.salary?.currency ?? "USD",
+        openToNegotiation: profile.salary?.openToNegotiation ?? ""
+      },
+      availability: {
+        noticePeriod: profile.availability?.noticePeriod ?? "",
+        earliestStartDate: profile.availability?.earliestStartDate ?? "",
+        currentlyEmployed: profile.availability?.currentlyEmployed ?? ""
+      },
+      workPreferences: {
+        mode: profile.workPreferences?.mode ?? "",
+        willingToRelocate: profile.workPreferences?.willingToRelocate ?? "",
+        travelPercent: profile.workPreferences?.travelPercent ?? "",
+        inPersonPercent: profile.workPreferences?.inPersonPercent ?? ""
       }
     },
     resumeText: profile.resumeText ?? "",
@@ -61,6 +97,39 @@ export function createApplicationRouter(): Router {
   const router = Router();
   const orchestrator = new OrchestratorService();
   const parser = new JobParserService();
+
+  router.get("/", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = req.user;
+      if (!user) {
+        res.status(401).json({ message: "Unauthorized" });
+        return;
+      }
+
+      const requestedLimit = Number.parseInt(String(req.query.limit ?? "30"), 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.min(Math.max(requestedLimit, 1), 200)
+        : 30;
+
+      const runs = await prisma.applicationRun.findMany({
+        where: { userId: user.id },
+        orderBy: { updatedAt: "desc" },
+        take: limit,
+        select: {
+          id: true,
+          jobUrl: true,
+          targetRole: true,
+          status: true,
+          currentStep: true,
+          updatedAt: true
+        }
+      });
+
+      res.json(runs);
+    } catch (error) {
+      next(error);
+    }
+  });
 
   router.post("/", async (req: Request, res: Response, next: NextFunction) => {
     try {

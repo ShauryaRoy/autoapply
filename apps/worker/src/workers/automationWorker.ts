@@ -214,7 +214,7 @@ export async function runAutomation(job: Job): Promise<void> {
     const profile = (metadata?.profile as any) ?? {};
     const answers = (metadata?.answers as Record<string, string> | undefined) ?? {};
     const resumeText = typeof metadata?.originalResume === "string" ? metadata.originalResume : String(metadata?.resumeText ?? "");
-    const resumeCanonical = metadata?.resumeCanonical as ResumeCanonical | undefined;
+    const resumeCanonical = metadata?.resumeCanonical as TailoredResume | undefined;
 
     if (resumeCanonical && metadata?.resumeLocked !== true && process.env.NODE_ENV !== "development") {
       // NOTE: strict mode locking! We only throw if it's explicitly enforced, else warn (to preserve dev pipeline).
@@ -258,9 +258,15 @@ export async function runAutomation(job: Job): Promise<void> {
           links: profile.links ?? {},
           resumeText,
           resumeCanonical,
-          yearsExperience: answers["years-experience"],
+          yearsExperience: profile.yearsExperience ?? answers["years-experience"],
           coverLetter: answers["cover-letter"],
-          answers
+          answers,
+          workAuth: profile.workAuth,
+          salary: profile.salary,
+          availability: profile.availability,
+          workPreferences: profile.workPreferences,
+          roles: profile.roles,
+          eeo: profile.eeo,
         },
         async (msg: string) => {
           console.log(`     📝 ${msg}`);

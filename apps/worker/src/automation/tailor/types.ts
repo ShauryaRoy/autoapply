@@ -5,13 +5,17 @@ export type JobProfile = {
   seniority: "intern" | "junior" | "mid" | "senior";
 };
 
+export type ResumeSectionEntry = {
+  title: string;
+  bullets: string[];
+};
+
 export type ResumeCanonical = {
   summary: string;
   skills: string[];
-  experience: Array<{
-    title: string;
-    bullets: string[];
-  }>;
+  experience: ResumeSectionEntry[];
+  projects: ResumeSectionEntry[];
+  activities: ResumeSectionEntry[];
   rawText: string;
   keywordsInjected: string[];
   version?: number;
@@ -24,9 +28,13 @@ export type AnalyzeJobInput = {
 };
 
 export type TailorResumeInput = {
-  baseResume: string;
-  jobProfile: JobProfile;
+  originalResume: string;
+  jobDescription: string;
+  requiredSkills: string[];
+  preferredSkills: string[];
 };
+
+export type TailoredResume = ResumeCanonical;
 
 export type EnhanceAnswersInput = {
   questions: string[];

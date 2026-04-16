@@ -282,8 +282,10 @@ export class LiveApplyController {
           logger.info("job.analyzed", { role: jobProfile.role });
 
           tailoredResume = await tailorResume({
-            baseResume: this.context.resumeText ?? "",
-            jobProfile
+            originalResume: this.context.resumeText ?? "",
+            jobDescription,
+            requiredSkills: jobProfile.skills,
+            preferredSkills: jobProfile.keywords
           });
           logger.info("resume.tailored");
 
@@ -336,15 +338,14 @@ export class LiveApplyController {
             return;
           }
 
-          if (scored.decision === "review") {
+          if (scored.decision === "review" && this.config.mode !== "assist") {
+            // Downgrade to assist only when the user has NOT already chosen assist.
             this.config = { ...this.config, mode: "assist" };
             logger.info("mode.selected", { mode: this.config.mode });
           }
 
-          if (scored.decision === "auto_apply" && this.config.mode === "assist") {
-            this.config = { ...this.config, mode: "smart_auto" };
-            logger.info("mode.selected", { mode: this.config.mode });
-          }
+          // Never upgrade the user's explicit assist (auto-off) choice based on job scoring.
+          // If the user chose assist mode, keep it regardless of decision.
         }
       }
 

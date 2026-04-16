@@ -27,6 +27,9 @@ import {
   type EeoProfile,
   type LinkProfile,
   type RolePreferences,
+  type SalaryPreferences,
+  type Availability,
+  type WorkPreferences,
   type OnboardingMessage,
   type OnboardingResponse,
   type OnboardingProfile
@@ -89,7 +92,7 @@ type ResumeOptimizationSnapshot = {
 
 type AuthUser = { id: string; email: string; firstName: string; lastName: string };
 type Screen = "auth" | "profile" | "profileView" | "apply";
-type ProfileSectionKey = "resume" | "roles" | "education" | "experience" | "workAuth" | "eeo" | "skills" | "personal" | "links";
+type ProfileSectionKey = "resume" | "roles" | "education" | "experience" | "workAuth" | "availability" | "salary" | "workPreferences" | "eeo" | "skills" | "personal" | "links";
 
 const ORDERED_STEPS = [
   "queued", "job_scraped", "job_analyzed", "resume_optimized",
@@ -103,6 +106,9 @@ const PROFILE_SECTIONS: Array<{ key: ProfileSectionKey; label: string }> = [
   { key: "education", label: "Education" },
   { key: "experience", label: "Experience" },
   { key: "workAuth", label: "Work Authorization" },
+  { key: "availability", label: "Availability" },
+  { key: "salary", label: "Salary" },
+  { key: "workPreferences", label: "Work Preferences" },
   { key: "eeo", label: "EEO" },
   { key: "skills", label: "Skills" },
   { key: "personal", label: "Personal" },
@@ -184,6 +190,25 @@ const EMPTY_LINKS: LinkProfile = {
   other: ""
 };
 
+const EMPTY_SALARY: SalaryPreferences = {
+  expected: "",
+  currency: "USD",
+  openToNegotiation: ""
+};
+
+const EMPTY_AVAILABILITY: Availability = {
+  noticePeriod: "",
+  earliestStartDate: "",
+  currentlyEmployed: ""
+};
+
+const EMPTY_WORK_PREFS: WorkPreferences = {
+  mode: "",
+  willingToRelocate: "",
+  travelPercent: "",
+  inPersonPercent: ""
+};
+
 const EMPTY_PROFILE: UserProfile = {
   firstName: "", lastName: "", email: "", phone: "",
   location: "", resumeText: "", linkedIn: "", portfolio: "",
@@ -196,6 +221,9 @@ const EMPTY_PROFILE: UserProfile = {
   skills: [],
   personal: { dateOfBirth: "" },
   links: EMPTY_LINKS,
+  salary: EMPTY_SALARY,
+  availability: EMPTY_AVAILABILITY,
+  workPreferences: EMPTY_WORK_PREFS,
   answers: {}
 };
 
@@ -271,6 +299,18 @@ function normalizeProfile(initial: UserProfile): UserProfile {
     links,
     linkedIn: links.linkedin,
     portfolio: links.portfolio,
+    salary: {
+      ...EMPTY_SALARY,
+      ...initial.salary
+    },
+    availability: {
+      ...EMPTY_AVAILABILITY,
+      ...initial.availability
+    },
+    workPreferences: {
+      ...EMPTY_WORK_PREFS,
+      ...initial.workPreferences
+    },
     answers: initial.answers ?? {}
   };
 }
@@ -1141,6 +1181,9 @@ function buildProfileAnswers(profile: UserProfile): Record<string, string> {
   const links = profile.links ?? EMPTY_LINKS;
   const auth = profile.workAuth ?? EMPTY_WORK_AUTH;
   const eeo = profile.eeo ?? EMPTY_EEO;
+  const sal = profile.salary ?? EMPTY_SALARY;
+  const avail = profile.availability ?? EMPTY_AVAILABILITY;
+  const prefs = profile.workPreferences ?? EMPTY_WORK_PREFS;
 
   return {
     "desired-roles": (profile.roles?.desiredRoles ?? []).join(", "),
@@ -1168,6 +1211,20 @@ function buildProfileAnswers(profile: UserProfile): Record<string, string> {
     "work-auth-canada": auth.canadaAuthorized,
     "work-auth-uk": auth.ukAuthorized,
     "work-auth-sponsorship": auth.needsVisaSponsorship,
+    // Availability
+    "notice-period": avail.noticePeriod ?? "",
+    "earliest-start-date": avail.earliestStartDate ?? "",
+    "currently-employed": avail.currentlyEmployed ?? "",
+    // Salary
+    "expected-salary": sal.expected ?? "",
+    "salary-currency": sal.currency ?? "USD",
+    "open-to-negotiation": sal.openToNegotiation ?? "",
+    // Work preferences
+    "work-mode": prefs.mode ?? "",
+    "willing-to-relocate": prefs.willingToRelocate ?? "",
+    "travel-percent": prefs.travelPercent ?? "",
+    "in-person-percent": prefs.inPersonPercent ?? "",
+    // EEO
     ethnicity: eeo.declineEthnicity ? "Decline to state" : eeo.ethnicities.join(", "),
     disability: eeo.disability,
     veteran: eeo.veteran,
@@ -1504,6 +1561,45 @@ function ProfileScreen({
         portfolio: links.portfolio
       };
     });
+  };
+
+  const setSalary = (field: keyof SalaryPreferences) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    setSaved(false);
+    setSectionWarning("");
+    setProfile((prev) => ({
+      ...prev,
+      salary: {
+        ...EMPTY_SALARY,
+        ...prev.salary,
+        [field]: e.target.value as SalaryPreferences[typeof field]
+      }
+    }));
+  };
+
+  const setAvailability = (field: keyof Availability) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    setSaved(false);
+    setSectionWarning("");
+    setProfile((prev) => ({
+      ...prev,
+      availability: {
+        ...EMPTY_AVAILABILITY,
+        ...prev.availability,
+        [field]: e.target.value as Availability[typeof field]
+      }
+    }));
+  };
+
+  const setWorkPreferences = (field: keyof WorkPreferences) => (e: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    setSaved(false);
+    setSectionWarning("");
+    setProfile((prev) => ({
+      ...prev,
+      workPreferences: {
+        ...EMPTY_WORK_PREFS,
+        ...prev.workPreferences,
+        [field]: e.target.value as WorkPreferences[typeof field]
+      }
+    }));
   };
 
   const handleResumePdfUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -2013,6 +2109,134 @@ function ProfileScreen({
                   <option value="yes">Yes</option>
                   <option value="no">No</option>
                 </select>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeSection === "availability" && (
+          <div className="profile-card">
+            <h2>Availability</h2>
+            <p className="section-hint">Used to answer start date, notice period, and scheduling questions on job applications</p>
+            <div className="field-grid">
+              <div className="field">
+                <label>Notice Period *</label>
+                <select value={profile.availability?.noticePeriod ?? ""} onChange={setAvailability("noticePeriod")}>
+                  <option value="">Select</option>
+                  <option value="Immediately">Immediately (no notice needed)</option>
+                  <option value="1 week">1 week</option>
+                  <option value="2 weeks">2 weeks</option>
+                  <option value="3 weeks">3 weeks</option>
+                  <option value="1 month">1 month</option>
+                  <option value="2 months">2 months</option>
+                  <option value="3 months">3 months</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Earliest Start Date</label>
+                <input
+                  value={profile.availability?.earliestStartDate ?? ""}
+                  onChange={setAvailability("earliestStartDate")}
+                  placeholder="e.g. Immediately, 2 weeks, June 2025"
+                />
+              </div>
+              <div className="field">
+                <label>Currently Employed?</label>
+                <select value={profile.availability?.currentlyEmployed ?? ""} onChange={setAvailability("currentlyEmployed")}>
+                  <option value="">Select</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeSection === "salary" && (
+          <div className="profile-card">
+            <h2>Salary Preferences</h2>
+            <p className="section-hint">Used to answer compensation questions on job applications</p>
+            <div className="field-grid">
+              <div className="field">
+                <label>Expected Salary</label>
+                <input
+                  value={profile.salary?.expected ?? ""}
+                  onChange={setSalary("expected")}
+                  placeholder="e.g. 90000 or Open to discussion"
+                />
+                <small className="mini-hint">Enter a number or "Open to discussion"</small>
+              </div>
+              <div className="field">
+                <label>Currency</label>
+                <select value={profile.salary?.currency ?? "USD"} onChange={setSalary("currency")}>
+                  <option value="USD">USD</option>
+                  <option value="CAD">CAD</option>
+                  <option value="GBP">GBP</option>
+                  <option value="EUR">EUR</option>
+                  <option value="AUD">AUD</option>
+                  <option value="INR">INR</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Open to Negotiation?</label>
+                <select value={profile.salary?.openToNegotiation ?? ""} onChange={setSalary("openToNegotiation")}>
+                  <option value="">Select</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeSection === "workPreferences" && (
+          <div className="profile-card">
+            <h2>Work Preferences</h2>
+            <p className="section-hint">Used to answer in-person %, remote, relocation, and travel questions on applications</p>
+            <div className="field-grid">
+              <div className="field">
+                <label>Preferred Work Mode *</label>
+                <select value={profile.workPreferences?.mode ?? ""} onChange={setWorkPreferences("mode")}>
+                  <option value="">Select</option>
+                  <option value="remote">Remote (fully remote preferred)</option>
+                  <option value="hybrid">Hybrid (some in-person okay)</option>
+                  <option value="onsite">Onsite (prefer in-office)</option>
+                  <option value="flexible">Flexible (open to anything)</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Willing to Relocate?</label>
+                <select value={profile.workPreferences?.willingToRelocate ?? ""} onChange={setWorkPreferences("willingToRelocate")}>
+                  <option value="">Select</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Max Travel % Comfortable With</label>
+                <select value={profile.workPreferences?.travelPercent ?? ""} onChange={setWorkPreferences("travelPercent")}>
+                  <option value="">Select</option>
+                  <option value="0">0% (no travel)</option>
+                  <option value="10">Up to 10%</option>
+                  <option value="25">Up to 25%</option>
+                  <option value="50">Up to 50%</option>
+                  <option value="75">Up to 75%</option>
+                  <option value="100">100% (fully mobile)</option>
+                </select>
+                <small className="mini-hint">e.g. If "25%" selected and form asks "willing to travel 10%?" → Yes; "50%?" → No</small>
+              </div>
+              <div className="field">
+                <label>Max In-Person % Comfortable With</label>
+                <select value={profile.workPreferences?.inPersonPercent ?? ""} onChange={setWorkPreferences("inPersonPercent")}>
+                  <option value="">Select</option>
+                  <option value="0">0% (fully remote)</option>
+                  <option value="10">Up to 10%</option>
+                  <option value="25">Up to 25%</option>
+                  <option value="50">Up to 50%</option>
+                  <option value="75">Up to 75%</option>
+                  <option value="100">100% (fully in-person)</option>
+                </select>
+                <small className="mini-hint">e.g. If "25%" selected and form asks "open to 25% in-person?" → Yes; "50%?" → No</small>
               </div>
             </div>
           </div>
