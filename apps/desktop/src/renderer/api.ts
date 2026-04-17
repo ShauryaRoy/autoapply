@@ -58,8 +58,38 @@ export async function login(payload: {
   return { token, userId };
 }
 
+export function clearStoredProfile(userId: string): void {
+  requireUserId(userId, "clearStoredProfile");
+  localStorage.removeItem(getProfileCacheKey(userId));
+  localStorage.removeItem(getOnboardingCacheKey(userId));
+}
+
+export function clearAllProfileCaches(): void {
+  // Nuclear option — wipes every known scoped key for all users
+  Object.keys(localStorage)
+    .filter(k => k.startsWith(PROFILE_KEY) || k.startsWith(ONBOARDING_PROFILE_KEY))
+    .forEach(k => localStorage.removeItem(k));
+}
+
+// All localStorage keys that are NOT scoped to a userId.
+// These must be wiped on every logout AND every login so that
+// account 1's data never bleeds into account 2's session.
+const UNSCOPED_SESSION_KEYS = [
+  "autoapply_resume_pdf_data_url",
+  "autoapply_resume_pdf_name",
+  "autoapply_resume_optimization_snapshot",
+  "autoapply_dashboard_job_history",
+  "autoapply_onboarding_success_message",
+] as const;
+
+export function clearUnscopedSessionData(): void {
+  UNSCOPED_SESSION_KEYS.forEach(k => localStorage.removeItem(k));
+}
+
 export function logout(): void {
   clearStoredToken();
+  clearAllProfileCaches();
+  clearUnscopedSessionData();
 }
 
 export async function getMe(): Promise<{
@@ -184,10 +214,27 @@ export type UserProfile = {
 };
 
 const PROFILE_KEY = "autoapply_profile";
+const ONBOARDING_PROFILE_KEY = "autoapply_onboarding_profile";
 
-export function getStoredProfile(): UserProfile | null {
+// ── Purge any legacy un-scoped keys left from previous builds ──────────
+;(function purgeLegacyKeys() {
+  [PROFILE_KEY, ONBOARDING_PROFILE_KEY].forEach(k => localStorage.removeItem(k));
+})();
+
+function requireUserId(userId: string | undefined, caller: string): asserts userId is string {
+  if (!userId || userId.trim() === "") {
+    throw new Error(`[auth-cache] ${caller} called without a userId — refusing to read/write shared cache key`);
+  }
+}
+
+function getProfileCacheKey(userId: string): string {
+  return `${PROFILE_KEY}_${userId}`;
+}
+
+export function getStoredProfile(userId: string): UserProfile | null {
+  requireUserId(userId, "getStoredProfile");
   try {
-    const raw = localStorage.getItem(PROFILE_KEY);
+    const raw = localStorage.getItem(getProfileCacheKey(userId));
     if (!raw) return null;
     return JSON.parse(raw) as UserProfile;
   } catch {
@@ -195,8 +242,9 @@ export function getStoredProfile(): UserProfile | null {
   }
 }
 
-export function saveProfile(profile: UserProfile): void {
-  localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+export function saveProfile(profile: UserProfile, userId: string): void {
+  requireUserId(userId, "saveProfile");
+  localStorage.setItem(getProfileCacheKey(userId), JSON.stringify(profile));
 }
 
 export async function getProfile(): Promise<UserProfile> {
@@ -357,11 +405,14 @@ export type OnboardingProfile = {
   };
 };
 
-const ONBOARDING_PROFILE_KEY = "autoapply_onboarding_profile";
+function getOnboardingCacheKey(userId: string): string {
+  return `${ONBOARDING_PROFILE_KEY}_${userId}`;
+}
 
-export function getStoredOnboardingProfile(): OnboardingProfile | null {
+export function getStoredOnboardingProfile(userId: string): OnboardingProfile | null {
+  requireUserId(userId, "getStoredOnboardingProfile");
   try {
-    const raw = localStorage.getItem(ONBOARDING_PROFILE_KEY);
+    const raw = localStorage.getItem(getOnboardingCacheKey(userId));
     if (!raw) return null;
     return JSON.parse(raw) as OnboardingProfile;
   } catch {
@@ -369,8 +420,9 @@ export function getStoredOnboardingProfile(): OnboardingProfile | null {
   }
 }
 
-export function saveOnboardingProfile(profile: OnboardingProfile): void {
-  localStorage.setItem(ONBOARDING_PROFILE_KEY, JSON.stringify(profile));
+export function saveOnboardingProfile(profile: OnboardingProfile, userId: string): void {
+  requireUserId(userId, "saveOnboardingProfile");
+  localStorage.setItem(getOnboardingCacheKey(userId), JSON.stringify(profile));
 }
 
 export async function extractFullProfile(resumeText: string): Promise<OnboardingProfile> {

@@ -50,7 +50,7 @@ const randomBetween = (min: number, max: number) => Math.floor(Math.random() * (
 type ExtractedField = {
   selector: string;
   label: string;
-  fieldType: "text" | "textarea" | "select" | "custom-select";
+  fieldType: "text" | "textarea" | "select" | "custom-select" | "file-upload";
   options: string[];
   suggestedValue: string;
   existingValue: string;
@@ -294,14 +294,28 @@ try {
   var tr = function(v) { return String(v || "").trim(); };
   var savedAnswers = data.savedAnswers || {};
 
-  var byPrompt = function(label) {
-    var key = norm(label); if (!key || key.length < 6) return "";
+  var bySaved = function(label) {
+    if (!label) return "";
     if (savedAnswers[label]) return tr(savedAnswers[label]);
     var lower = label.toLowerCase();
     var sk = Object.keys(savedAnswers);
     for (var i = 0; i < sk.length; i++) {
       if (norm(sk[i]).includes(lower) || lower.includes(norm(sk[i]))) return tr(savedAnswers[sk[i]]);
     }
+    var keyWords = norm(label).split(/\\s+/).filter(function(w) { return w.length > 3; });
+    if (keyWords.length < 2) return "";
+    var bestScore = 0; var bestVal = "";
+    for (var j = 0; j < sk.length; j++) {
+      var pw2 = norm(sk[j]).split(/\\s+/).filter(function(w) { return w.length > 3; });
+      var ov = 0; for (var wi2 = 0; wi2 < keyWords.length; wi2++) { if (pw2.indexOf(keyWords[wi2]) >= 0) ov++; }
+      var sc = keyWords.length > 0 ? ov / keyWords.length : 0;
+      if (sc >= 0.5 && sc > bestScore) { bestScore = sc; bestVal = savedAnswers[sk[j]]; }
+    }
+    return tr(bestVal);
+  };
+
+  var byPrompt = function(label) {
+    var key = norm(label); if (!key || key.length < 6) return "";
     var keyWords = key.split(/\\s+/).filter(function(w) { return w.length > 3; });
     if (keyWords.length < 2) return "";
     for (var ai = 0; ai < (data.answers || []).length; ai++) {
@@ -327,8 +341,8 @@ try {
     if (key.includes("portfolio") || key.includes("personal website") || key.includes("website url")) return tr(data.portfolio || data.github || data.linkedIn);
     if ((key.includes("city") || key.includes("where are you based") || (/\\blocation\\b/.test(key) && !key.includes("relocation")) || (/\\baddress\\b/.test(key) && !key.includes("ip address"))) && !key.includes("hispanic") && !key.includes("ethnic") && !key.includes("race")) return tr(data.location);
     if (key.includes("years") && key.includes("experience")) return tr(data.yearsExperience || "3");
-    if (key.includes("why") && (key.includes("company") || key.includes("us") || key.includes("interest"))) return tr(data.whyCompany || byPrompt(label));
-    if (key.includes("cover letter") || key.includes("covering letter")) return tr(data.whyCompany || byPrompt(label));
+    if (key.includes("why") && (key.includes("company") || key.includes("us") || key.includes("interest"))) return tr(data.whyCompany || bySaved(label) || byPrompt(label));
+    if (key.includes("cover letter") || key.includes("covering letter")) return tr(data.whyCompany || bySaved(label) || byPrompt(label));
     if ((key.includes("sponsor") || key.includes("visa")) && (key.includes("require") || key.includes("need") || key.includes("will you"))) return "No";
     if ((key.includes("authoriz") || key.includes("eligible") || key.includes("right to work") || key.includes("legally permitted")) && !key.includes("ethnic") && !key.includes("hispanic")) return "Yes";
     if (key.includes("open to relocation") || key.includes("willing to relocate") || key.includes("relocate for")) return "Yes";
@@ -336,7 +350,7 @@ try {
     if (key.includes("interviewed") && key.includes("before")) return "No";
     if (key.includes("hispanic") || key.includes("latino") || key.includes("ethnic") || key.includes("race") || key.includes("gender") || key.includes("veteran") || key.includes("disabilit") || key.includes("lgbtq") || key.includes("pronounc")) return "";
     if (key.includes("how did you hear") || key.includes("referral") || key.includes("referred by")) return "";
-    return byPrompt(label);
+    return bySaved(label) || byPrompt(label);
   };
 
   var getDocs = function() {
@@ -434,9 +448,11 @@ try {
     for (var ci = 0; ci < candidates.length; ci++) {
       var el = candidates[ci];
       try {
-        if (el.tagName === "INPUT" && /hidden|file|checkbox|radio|submit|button|reset|image/.test(el.type || "")) continue;
+        if (el.tagName === "INPUT" && /hidden|checkbox|radio|submit|button|reset|image/.test(el.type || "")) continue;
         if (el.disabled || el.readOnly) continue;
-        if (!isVis(el, view)) continue;
+        // file inputs are styled display:none but still functional — check parent is visible
+        if (el.type === "file") { try { var par = el.parentElement; var pr = par ? par.getBoundingClientRect() : null; if (!par || !pr || (pr.width === 0 && pr.height === 0)) continue; } catch(ef) {} }
+        else if (!isVis(el, view)) continue;
         if (isPhonePicker(el)) continue;
         var sel = getUniqueSelector(el);
         if (seen[sel]) continue; seen[sel] = true;
@@ -444,6 +460,12 @@ try {
         var label = cleanLabel(rawLabel);
         var val = fieldValue(label);
         var existing = tr(el.value || "");
+        // File upload — capture as its own field type, never fall through to text/select logic
+        if (el.type === "file") {
+          var flbl = (label && label.length >= 3) ? label : ((el.getAttribute("accept") || "").includes("pdf") ? "Resume / CV" : "File Upload");
+          fields.push({ selector: sel, label: flbl, fieldType: "file-upload", options: [], suggestedValue: "resume", existingValue: existing });
+          continue;
+        }
         if (isCustom(el)) {
           var clbl = (label && label.length >= 3) ? label : ("Dropdown " + (fields.length + 1));
           fields.push({ selector: sel, label: clbl, fieldType: "custom-select", options: [], suggestedValue: fieldValue(clbl) || "", existingValue: existing });
@@ -680,6 +702,68 @@ try {
     return true;
   };
 
+  // ── RESUME UPLOAD ──────────────────────────────────────────────────────────
+  // Reads the stored resume PDF from localStorage and injects it into the
+  // webview's file input via the DataTransfer API (Chromium-native, no OS dialog).
+  const performResumeUpload = async (selector: string): Promise<boolean> => {
+    const resumeDataUrl = localStorage.getItem("autoapply_resume_pdf_data_url") ?? "";
+    const resumeFileName = localStorage.getItem("autoapply_resume_pdf_name") ?? "resume.pdf";
+    if (!resumeDataUrl || !resumeDataUrl.startsWith("data:")) {
+      console.warn("[AutoApply:upload] No resume PDF stored. Upload PDF in profile first.");
+      return false;
+    }
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+    // JSON.stringify safely encodes the data URL (base64 + ASCII only after 'data:...,')
+    const safeDataUrl = JSON.stringify(resumeDataUrl);
+    const safeFileName = JSON.stringify(resumeFileName);
+    const script = `
+(function() {
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var dataUrl = ${safeDataUrl};
+  var fileName = ${safeFileName};
+  // Find the file input: direct hit, nearest in container, or any on page
+  var el = document.querySelector(sel);
+  var fileInput = null;
+  if (el && el.tagName === "INPUT" && el.type === "file") {
+    fileInput = el;
+  } else {
+    if (el) {
+      var con = el.closest("form") || el.closest("[class*='upload']") || el.closest("[class*='drop']") || el.parentElement;
+      if (con) fileInput = con.querySelector("input[type='file']");
+    }
+    if (!fileInput) fileInput = document.querySelector("input[type='file']");
+  }
+  if (!fileInput) return { ok: false, reason: "no-file-input" };
+  // Build File from data URL
+  var comma = dataUrl.indexOf(",");
+  var b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  var mimeM = dataUrl.match(/data:([^;]+);/);
+  var mime = mimeM ? mimeM[1] : "application/pdf";
+  var bin = atob(b64);
+  var bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  var file = new File([bytes], fileName, { type: mime, lastModified: Date.now() });
+  var dt = new DataTransfer();
+  dt.items.add(file);
+  // Assign files — React-compatible via property descriptor, fallback direct assign
+  try { Object.defineProperty(fileInput, "files", { value: dt.files, configurable: true, writable: true }); } catch(ex) { fileInput.files = dt.files; }
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+  // Also notify custom dropzone wrappers
+  try { var dz = fileInput.closest("[class*='upload']") || fileInput.closest("[class*='drop']") || fileInput.parentElement; if (dz && dz !== fileInput) dz.dispatchEvent(new Event("change", { bubbles: true })); } catch(ez) {}
+  return { ok: true, fileName: file.name, fileSize: file.size };
+} catch(e) { return { ok: false, err: String(e.message || e) }; }
+})()`;
+    const result = await runInWebview(script, 10000, "resumeUpload");
+    if (result?.ok) {
+      console.log(`[AutoApply:upload] Uploaded "${result.fileName}" (${result.fileSize} bytes)`);
+      return true;
+    }
+    console.warn("[AutoApply:upload] Failed:", result?.reason ?? result?.err);
+    return false;
+  };
+
   // ── FILL: fill all visible form fields with profile data ────────────────
   const fillForm = async (): Promise<{ filled: number; unfilled: UnfilledField[]; message: string } | null> => {
     const p = profileRef.current;
@@ -714,14 +798,28 @@ try {
   var tr = function(v) { return String(v || "").trim(); };
   var savedAnswers = data.savedAnswers || {};
 
-  var byPrompt = function(label) {
-    var key = norm(label); if (!key || key.length < 6) return "";
+  var bySaved = function(label) {
+    if (!label) return "";
     if (savedAnswers[label]) return tr(savedAnswers[label]);
     var lower = label.toLowerCase();
     var sk = Object.keys(savedAnswers);
     for (var i = 0; i < sk.length; i++) {
       if (norm(sk[i]).includes(lower) || lower.includes(norm(sk[i]))) return tr(savedAnswers[sk[i]]);
     }
+    var keyWords = norm(label).split(/\\s+/).filter(function(w) { return w.length > 3; });
+    if (keyWords.length < 2) return "";
+    var bestScore = 0; var bestVal = "";
+    for (var j = 0; j < sk.length; j++) {
+      var pw2 = norm(sk[j]).split(/\\s+/).filter(function(w) { return w.length > 3; });
+      var ov = 0; for (var wi2 = 0; wi2 < keyWords.length; wi2++) { if (pw2.indexOf(keyWords[wi2]) >= 0) ov++; }
+      var sc = keyWords.length > 0 ? ov / keyWords.length : 0;
+      if (sc >= 0.5 && sc > bestScore) { bestScore = sc; bestVal = savedAnswers[sk[j]]; }
+    }
+    return tr(bestVal);
+  };
+
+  var byPrompt = function(label) {
+    var key = norm(label); if (!key || key.length < 6) return "";
     var keyWords = key.split(/\\s+/).filter(function(w) { return w.length > 3; });
     if (keyWords.length < 2) return "";
     for (var ai = 0; ai < (data.answers || []).length; ai++) {
@@ -747,8 +845,8 @@ try {
     if (key.includes("portfolio") || key.includes("personal website") || key.includes("website url")) return tr(data.portfolio || data.github || data.linkedIn);
     if ((key.includes("city") || key.includes("where are you based") || (/\\blocation\\b/.test(key) && !key.includes("relocation")) || (/\\baddress\\b/.test(key) && !key.includes("ip address"))) && !key.includes("hispanic") && !key.includes("ethnic") && !key.includes("race")) return tr(data.location);
     if (key.includes("years") && key.includes("experience")) return tr(data.yearsExperience || "3");
-    if (key.includes("why") && (key.includes("company") || key.includes("us") || key.includes("interest"))) return tr(data.whyCompany || byPrompt(label));
-    if (key.includes("cover letter") || key.includes("covering letter")) return tr(data.whyCompany || byPrompt(label));
+    if (key.includes("why") && (key.includes("company") || key.includes("us") || key.includes("interest"))) return tr(data.whyCompany || bySaved(label) || byPrompt(label));
+    if (key.includes("cover letter") || key.includes("covering letter")) return tr(data.whyCompany || bySaved(label) || byPrompt(label));
     if ((key.includes("sponsor") || key.includes("visa")) && (key.includes("require") || key.includes("need") || key.includes("will you"))) return "No";
     if ((key.includes("authoriz") || key.includes("eligible") || key.includes("right to work") || key.includes("legally permitted")) && !key.includes("ethnic") && !key.includes("hispanic")) return "Yes";
     if (key.includes("open to relocation") || key.includes("willing to relocate") || key.includes("relocate for")) return "Yes";
@@ -756,7 +854,7 @@ try {
     if (key.includes("interviewed") && key.includes("before")) return "No";
     if (key.includes("hispanic") || key.includes("latino") || key.includes("ethnic") || key.includes("race") || key.includes("gender") || key.includes("veteran") || key.includes("disabilit") || key.includes("lgbtq") || key.includes("pronounc")) return "";
     if (key.includes("how did you hear") || key.includes("referral") || key.includes("referred by")) return "";
-    return byPrompt(label);
+    return bySaved(label) || byPrompt(label);
   };
 
   var getDocs = function() {
@@ -1590,6 +1688,21 @@ try {
           await humanHighlightField(field.selector, true);
           await sleep(randomBetween(200, 400));
 
+          // ── Resume / file upload — inject stored PDF, never ask user ──
+          if (field.fieldType === "file-upload") {
+            setStatus(`Uploading resume for "${field.label}"...`);
+            const uploaded = await performResumeUpload(field.selector);
+            await humanHighlightField(field.selector, false);
+            if (uploaded) {
+              totalFilled++;
+              setStatus(`\u2713 Uploaded resume`);
+            } else {
+              setStatus("Resume upload failed \u2014 please upload your PDF in your profile first.");
+            }
+            await sleep(randomBetween(600, 1200));
+            continue;
+          }
+
           if (field.suggestedValue) {
             // We know the answer — fill it human-like
             let filled = false;
@@ -1627,44 +1740,191 @@ try {
             // Pause between fields like a human
             await sleep(randomBetween(400, 900));
           } else {
-            // No known answer — collect for user input panel
-            await humanHighlightField(field.selector, false);
+            // No AI-generated answer — check if profile has a saved answer
+            const savedAnswer = profileRef.current.answers?.[field.label];
+            
+            if (savedAnswer) {
+              // Profile has a saved answer for this field — auto-fill without asking
+              let filled = false;
 
-            if ((field.fieldType === "custom-select" || field.fieldType === "select") && field.options.length === 0) {
-              // Open dropdown / read native select to extract options for the panel
-              setStatus(`Reading options for "${field.label}"...`);
-              const opts = await fetchDropdownOptions(field.selector);
-              field.options = opts;
-              await sleep(randomBetween(200, 400));
+              if (field.fieldType === "text" || field.fieldType === "textarea") {
+                filled = await humanTypeInField(field.selector, savedAnswer);
+              } else if (field.fieldType === "select") {
+                filled = await humanSelectNativeOption(field.selector, savedAnswer);
+              } else if (field.fieldType === "custom-select") {
+                filled = await humanFillCustomDropdown(field.selector, savedAnswer);
+              }
+
+              await humanHighlightField(field.selector, false);
+
+              if (filled) {
+                totalFilled++;
+                setStatus(`✓ Filled "${field.label}" (from saved profile)`);
+              } else {
+                // Auto-fill from profile failed — add to needsInput with the profile answer pre-filled
+                if ((field.fieldType === "custom-select" || field.fieldType === "select") && field.options.length === 0) {
+                  setStatus(`Reading options for "${field.label}"...`);
+                  const opts = await fetchDropdownOptions(field.selector);
+                  field.options = opts;
+                }
+                needsInput.push({
+                  label: field.label,
+                  selector: field.selector,
+                  fieldType: field.fieldType === "custom-select" ? "custom-select" : field.fieldType === "select" ? "select" : field.fieldType === "textarea" ? "textarea" : "text",
+                  options: field.options,
+                  autoValue: savedAnswer,
+                });
+              }
+            } else {
+              // No saved answer — genuinely unknown, ask user
+              await humanHighlightField(field.selector, false);
+
+              if ((field.fieldType === "custom-select" || field.fieldType === "select") && field.options.length === 0) {
+                // Open dropdown / read native select to extract options for the panel
+                setStatus(`Reading options for "${field.label}"...`);
+                const opts = await fetchDropdownOptions(field.selector);
+                field.options = opts;
+                await sleep(randomBetween(200, 400));
+              }
+
+              needsInput.push({
+                label: field.label,
+                selector: field.selector,
+                fieldType: field.fieldType === "custom-select" ? "custom-select" : field.fieldType === "select" ? "select" : field.fieldType === "textarea" ? "textarea" : "text",
+                options: field.options,
+                autoValue: "",
+              });
             }
-
-            needsInput.push({
-              label: field.label,
-              selector: field.selector,
-              fieldType: field.fieldType === "custom-select" ? "custom-select" : field.fieldType === "select" ? "select" : field.fieldType === "textarea" ? "textarea" : "text",
-              options: field.options,
-              autoValue: "",
-            });
           }
         }
 
         if (loopTokenRef.current !== token) break;
 
-        // ── Step 4: Show unfilled fields panel if any ──────────────────
-        if (needsInput.length > 0) {
-          setUnfilledFields(needsInput);
-
-          // Pre-populate from saved profile answers
-          const pre: Record<string, string> = {};
-          for (const f of needsInput) {
-            const saved = profileRef.current.answers?.[f.label];
-            if (saved) pre[f.selector] = saved;
-            if (f.autoValue) pre[f.selector] = f.autoValue;
+        // ── Step 3b: Re-scan for conditional fields that appeared after filling ──
+        // Some ATS forms reveal new fields after a parent is filled (e.g. selecting
+        // "Yes" reveals a follow-up). Run up to 3 passes until the DOM stabilises.
+        {
+          const processedSelectors = new Set(fields.map((f) => f.selector));
+          for (let xPass = 0; xPass < 3; xPass++) {
+            if (loopTokenRef.current !== token) break;
+            await sleep(randomBetween(700, 1200));
+            const freshFields = await extractFormFields();
+            if (!freshFields || freshFields.length === 0) break;
+            const newFields = freshFields.filter((f) => !processedSelectors.has(f.selector));
+            if (newFields.length === 0) break;
+            setStatus(`Found ${newFields.length} new field(s) after filling — processing...`);
+            for (const nf of newFields) {
+              if (loopTokenRef.current !== token) break;
+              processedSelectors.add(nf.selector);
+              if (nf.existingValue && nf.existingValue.length > 1) {
+                if (nf.fieldType === "text" || nf.fieldType === "textarea") continue;
+                if (nf.suggestedValue && nf.existingValue.toLowerCase() === nf.suggestedValue.toLowerCase()) continue;
+                if (!nf.suggestedValue) continue;
+              }
+              await humanScrollToField(nf.selector);
+              await sleep(randomBetween(200, 400));
+              await humanHighlightField(nf.selector, true);
+              await sleep(randomBetween(150, 300));
+              if (nf.fieldType === "file-upload") {
+                const up = await performResumeUpload(nf.selector);
+                await humanHighlightField(nf.selector, false);
+                if (up) totalFilled++;
+                await sleep(randomBetween(400, 800));
+                continue;
+              }
+              if (nf.suggestedValue) {
+                let filled = false;
+                if (nf.fieldType === "text" || nf.fieldType === "textarea") filled = await humanTypeInField(nf.selector, nf.suggestedValue);
+                else if (nf.fieldType === "select") filled = await humanSelectNativeOption(nf.selector, nf.suggestedValue);
+                else if (nf.fieldType === "custom-select") filled = await humanFillCustomDropdown(nf.selector, nf.suggestedValue);
+                await humanHighlightField(nf.selector, false);
+                if (filled) {
+                  totalFilled++;
+                } else {
+                  if ((nf.fieldType === "custom-select" || nf.fieldType === "select") && nf.options.length === 0) { const opts = await fetchDropdownOptions(nf.selector); nf.options = opts; }
+                  needsInput.push({ label: nf.label, selector: nf.selector, fieldType: nf.fieldType === "custom-select" ? "custom-select" : nf.fieldType === "select" ? "select" : nf.fieldType === "textarea" ? "textarea" : "text", options: nf.options, autoValue: nf.suggestedValue });
+                }
+              } else {
+                // No AI answer — check if profile has a saved answer
+                const savedNfAnswer = profileRef.current.answers?.[nf.label];
+                if (savedNfAnswer) {
+                  // Profile has saved answer — auto-fill without asking
+                  let nfFilled = false;
+                  if (nf.fieldType === "text" || nf.fieldType === "textarea") nfFilled = await humanTypeInField(nf.selector, savedNfAnswer);
+                  else if (nf.fieldType === "select") nfFilled = await humanSelectNativeOption(nf.selector, savedNfAnswer);
+                  else if (nf.fieldType === "custom-select") nfFilled = await humanFillCustomDropdown(nf.selector, savedNfAnswer);
+                  await humanHighlightField(nf.selector, false);
+                  if (nfFilled) {
+                    totalFilled++;
+                  } else {
+                    if ((nf.fieldType === "custom-select" || nf.fieldType === "select") && nf.options.length === 0) { const opts = await fetchDropdownOptions(nf.selector); nf.options = opts; }
+                    needsInput.push({ label: nf.label, selector: nf.selector, fieldType: nf.fieldType === "custom-select" ? "custom-select" : nf.fieldType === "select" ? "select" : nf.fieldType === "textarea" ? "textarea" : "text", options: nf.options, autoValue: savedNfAnswer });
+                  }
+                } else {
+                  // No saved answer — genuinely unknown
+                  await humanHighlightField(nf.selector, false);
+                  if ((nf.fieldType === "custom-select" || nf.fieldType === "select") && nf.options.length === 0) { const opts = await fetchDropdownOptions(nf.selector); nf.options = opts; await sleep(randomBetween(200, 400)); }
+                  needsInput.push({ label: nf.label, selector: nf.selector, fieldType: nf.fieldType === "custom-select" ? "custom-select" : nf.fieldType === "select" ? "select" : nf.fieldType === "textarea" ? "textarea" : "text", options: nf.options, autoValue: "" });
+                }
+              }
+              await sleep(randomBetween(300, 600));
+            }
           }
-          if (Object.keys(pre).length > 0) setUserAnswers((prev) => ({ ...prev, ...pre }));
+        }
 
-          setStatus(`Filled ${totalFilled} field(s). ${needsInput.length} need your input — answer below.`);
-          break;
+
+        if (loopTokenRef.current !== token) break;
+
+        // ── Step 4: Auto-apply known answers; only ask user for truly unknown fields ──
+        if (needsInput.length > 0) {
+          // Split: fields where the automation already knows the answer vs genuinely unknown
+          const withAutoValue  = needsInput.filter((f) => !!f.autoValue?.trim());
+          const withoutAutoValue = needsInput.filter((f) => !f.autoValue?.trim());
+
+          // Auto-apply fields that already have a computed answer (don't bother the user)
+          let autoApplyFailed = new Set<string>();
+          if (withAutoValue.length > 0) {
+            setStatus(`Auto-applying ${withAutoValue.length} known answer(s) without asking...`);
+            await sleep(randomBetween(400, 700));
+            if (loopTokenRef.current !== token) break;
+            const autoMap: Record<string, string> = {};
+            const autoFMap = new Map<string, UnfilledField>();
+            const autoLabels: Record<string, string> = {};
+            for (const f of withAutoValue) {
+              autoMap[f.selector] = f.autoValue!;
+              autoFMap.set(f.selector, f);
+              autoLabels[f.label] = f.autoValue!;
+            }
+            autoApplyFailed = await applyUserAnswersToForm(autoMap, autoFMap);
+            totalFilled += withAutoValue.length - autoApplyFailed.size;
+            // Persist the newly applied answers to the profile
+            const savedLabels: Record<string, string> = {};
+            for (const f of withAutoValue) { if (!autoApplyFailed.has(f.selector)) savedLabels[f.label] = f.autoValue!; }
+            if (Object.keys(savedLabels).length > 0) {
+              const updated = { ...profileRef.current, answers: { ...(profileRef.current.answers ?? {}), ...savedLabels } };
+              saveProfile(updated); await putProfile(updated).catch(() => {}); onProfileUpdate?.(updated);
+            }
+          }
+
+          // Anything still unfilled = truly unknown + auto-apply failures
+          const stillNeeded = [
+            ...withoutAutoValue,
+            ...withAutoValue.filter((f) => autoApplyFailed.has(f.selector)),
+          ];
+
+          if (stillNeeded.length > 0) {
+            setUnfilledFields(stillNeeded);
+            const pre: Record<string, string> = {};
+            for (const f of stillNeeded) {
+              const saved = profileRef.current.answers?.[f.label];
+              if (saved) pre[f.selector] = saved;
+              if (f.autoValue) pre[f.selector] = f.autoValue;
+            }
+            if (Object.keys(pre).length > 0) setUserAnswers((prev) => ({ ...prev, ...pre }));
+            setStatus(`Filled ${totalFilled} field(s). ${stillNeeded.length} need your input — answer below.`);
+            break;
+          }
+          // All known answers applied successfully — fall through to Step 5
         }
 
         // ── Step 5: Advance form (Next / Submit) ───────────────────────

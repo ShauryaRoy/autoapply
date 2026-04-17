@@ -6,9 +6,13 @@ import {
   getMe,
   getProfile,
   getStoredToken,
+  clearStoredToken,
   getStoredProfile,
   putProfile,
   saveProfile,
+  clearStoredProfile,
+  clearAllProfileCaches,
+  clearUnscopedSessionData,
   createApplication,
   getApplication,
   getLatestPreview,
@@ -1261,7 +1265,8 @@ function AuthScreen({ onAuth }: { onAuth: (user: AuthUser) => void }) {
     try {
       if (mode === "register") {
         await register({ email, password, firstName, lastName });
-        onAuth({ id: "", email, firstName, lastName });
+        const me = await getMe();
+        onAuth(me);
       } else {
         await login({ email, password });
         const me = await getMe();
@@ -2692,7 +2697,7 @@ function OnboardingScreen({
 
         // Save the onboarding profile
         if (response.data) {
-          saveOnboardingProfile(response.data as any);
+          saveOnboardingProfile(response.data as any, user.id);
         }
       }
     } catch (err) {
@@ -2760,7 +2765,7 @@ function OnboardingScreen({
       answers
     };
 
-    saveProfile(profile);
+    saveProfile(profile, user.id);
     onComplete(profile);
   };
 
@@ -3369,41 +3374,42 @@ export function App() {
   const [bootstrapping, setBootstrapping] = useState(true);
 
   const persistProfileAuthoritatively = useCallback(async (nextProfile: UserProfile): Promise<UserProfile> => {
+    if (!user?.id) throw new Error("persistProfileAuthoritatively called without authenticated user");
     const normalized = normalizeProfile(nextProfile);
     setProfile(normalized);
-    saveProfile(normalized);
+    saveProfile(normalized, user.id);
 
     try {
       const saved = await putProfile(normalized);
       const authoritative = normalizeProfile(saved);
       setProfile(authoritative);
-      saveProfile(authoritative);
+      saveProfile(authoritative, user.id);
       return authoritative;
     } catch {
       return normalized;
     }
-  }, []);
+  }, [user]);
 
   const hydrateProfileFromBackend = useCallback(async (me: AuthUser): Promise<UserProfile> => {
+    // Hard guard — never operate without a concrete user ID
+    if (!me.id) throw new Error("hydrateProfileFromBackend called without user.id");
+
     try {
       const backendProfile = normalizeProfile(await getProfile());
-      let authoritative = normalizeProfile({
+      const authoritative = normalizeProfile({
         ...backendProfile,
         firstName: backendProfile.firstName || me.firstName,
         lastName: backendProfile.lastName || me.lastName,
         email: backendProfile.email || me.email
       });
 
-      const cache = getStoredProfile();
-      if (isProfileEffectivelyEmpty(authoritative) && cache && !isProfileEffectivelyEmpty(cache)) {
-        authoritative = normalizeProfile(await putProfile(cache));
-      }
-
-      saveProfile(authoritative);
+      saveProfile(authoritative, me.id);
       return authoritative;
     } catch {
-      const cache = getStoredProfile();
+      // Fallback ONLY to this user's own scoped cache
+      const cache = getStoredProfile(me.id);
       if (cache) return normalizeProfile(cache);
+      // No cache for this user — return clean empty profile, never another user's data
       return normalizeProfile({ ...EMPTY_PROFILE, firstName: me.firstName, lastName: me.lastName, email: me.email });
     }
   }, []);
@@ -3415,6 +3421,9 @@ export function App() {
 
     getMe()
       .then(async (me) => {
+        // Reset state before loading the resumed user's data
+        setUser(null);
+        setProfile(EMPTY_PROFILE);
         setUser(me);
         const authoritativeProfile = await hydrateProfileFromBackend(me);
         setProfile(authoritativeProfile);
@@ -3425,14 +3434,23 @@ export function App() {
         }
       })
       .catch(() => {
-        // Token expired or invalid
-        localStorage.removeItem("autoapply_token");
+        // Token expired or invalid — nuke everything
+        clearStoredToken();
+        clearAllProfileCaches();
+        setUser(null);
+        setProfile(EMPTY_PROFILE);
         setScreen("auth");
       })
       .finally(() => setBootstrapping(false));
   }, []);
 
   const handleAuth = (u: AuthUser) => {
+    // Wipe unscoped localStorage data from any previous session before
+    // loading the new user's data — prevents cross-account data leakage.
+    clearUnscopedSessionData();
+    // Reset profile state immediately before loading the new user's data
+    setUser(null);
+    setProfile(EMPTY_PROFILE);
     setUser(u);
     void (async () => {
       const authoritativeProfile = await hydrateProfileFromBackend(u);
@@ -3448,7 +3466,9 @@ export function App() {
   }, [persistProfileAuthoritatively]);
 
   const handleLogout = () => {
-    logout();
+    const userId = user?.id;
+    logout(); // clears token + all profile caches
+    if (userId) clearStoredProfile(userId); // belt-and-suspenders: explicit wipe for this user
     setUser(null);
     setProfile(EMPTY_PROFILE);
     setScreen("auth");

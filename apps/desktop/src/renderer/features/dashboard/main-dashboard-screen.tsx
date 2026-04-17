@@ -777,7 +777,15 @@ const FIT_STOP_WORDS = new Set([
   "the", "and", "for", "with", "from", "this", "that", "you", "your", "our", "are", "not", "will", "have",
   "has", "job", "role", "team", "work", "using", "into", "their", "they", "them", "but", "all", "can", "who",
   "what", "when", "where", "how", "why", "about", "across", "into", "over", "under", "per", "via", "too",
-  "any", "out", "one", "two", "three", "four", "five", "new", "now", "yet"
+  "any", "out", "one", "two", "three", "four", "five", "new", "now", "yet",
+  // Generic resume / JD filler that inflates match scores
+  "experience", "strong", "technical", "excellent", "required", "preferred", "must", "year", "years",
+  "good", "ability", "knowledge", "skill", "skills", "make", "build", "well", "plus", "nice", "ideally",
+  "like", "also", "both", "other", "more", "less", "such", "help", "level", "high", "key", "great",
+  "highly", "proven", "solid", "hands", "passion", "driven", "fast", "paced", "startup", "dynamic",
+  "exciting", "opportunity", "competitive", "minimum", "degree", "equivalent", "including", "related",
+  "ability", "understanding", "familiarity", "exposure", "background", "proficiency", "bonus",
+  "responsibilities", "qualifications", "requirements", "benefits", "apply", "hire", "hiring"
 ]);
 
 const SKILL_ALIASES: Record<string, string> = {
@@ -818,18 +826,45 @@ const ROLE_TERMS = new Set([
 ]);
 
 const KNOWN_SKILL_TERMS = new Set([
-  "javascript", "typescript", "nodejs", "react", "python", "java", "go", "rust", "graphql", "postgresql",
-  "mongodb", "redis", "kubernetes", "docker", "aws", "gcp", "azure", "tensorflow", "pytorch", "langchain",
-  "machine", "learning", "artificial", "intelligence", "nextjs", "nestjs", "vue", "angular", "fastapi",
-  "machine_learning", "data_science", "computer_vision", "natural_language_processing", "deep_learning", "artificial_intelligence"
+  // Languages
+  "javascript", "typescript", "python", "java", "go", "rust", "ruby", "php", "swift", "kotlin",
+  "scala", "csharp", "cpp", "c", "elixir", "erlang", "clojure", "haskell", "dart", "bash", "shell",
+  "sql", "html", "css", "sass", "scss",
+  // Frontend
+  "react", "nextjs", "vue", "nuxt", "angular", "svelte", "webpack", "vite", "babel", "tailwind",
+  "redux", "mobx", "zustand", "graphql", "apollo", "trpc",
+  // Backend / frameworks
+  "nodejs", "nestjs", "express", "fastapi", "django", "flask", "rails", "spring", "laravel",
+  "gin", "fiber", "phoenix", "actix", "grpc", "rest", "api", "websocket",
+  // Databases
+  "postgresql", "postgres", "mysql", "sqlite", "mongodb", "redis", "elasticsearch", "cassandra",
+  "dynamodb", "firebase", "supabase", "prisma", "sequelize", "typeorm", "drizzle",
+  "snowflake", "bigquery", "redshift", "clickhouse",
+  // Cloud / infra
+  "aws", "gcp", "azure", "docker", "kubernetes", "terraform", "ansible", "helm", "istio",
+  "lambda", "serverless", "s3", "ec2", "ecs", "eks", "gke", "aks", "nginx", "linux",
+  "github", "gitlab", "bitbucket", "jenkins", "ci", "cd",
+  // Data / ML
+  "tensorflow", "pytorch", "langchain", "openai", "sklearn", "scikit", "pandas", "numpy", "scipy",
+  "spark", "hadoop", "airflow", "dbt", "kafka", "rabbitmq", "pinecone", "faiss", "weaviate",
+  "tableau", "powerbi", "looker", "embedding", "vector", "llm", "rag", "bert", "transformer",
+  // Multi-word normalized
+  "machine_learning", "data_science", "computer_vision", "natural_language_processing",
+  "deep_learning", "artificial_intelligence",
+  // Mobile / other
+  "flutter", "unity", "unreal", "stripe", "twilio", "sendgrid", "playwright", "cypress", "selenium",
+  "jest", "pytest", "vitest", "storybook", "microservices", "monorepo"
 ]);
 
 const SKILL_FAMILIES: Record<string, string[]> = {
-  frontend: ["react", "angular", "vue"],
-  backend: ["nodejs", "spring", "django", "express"],
-  cloud: ["aws", "gcp", "azure"],
-  ml: ["machine_learning", "deep_learning", "tensorflow", "pytorch"],
-  data: ["sql", "postgres", "mongodb"],
+  frontend: ["react", "angular", "vue", "svelte", "nextjs", "nuxt"],
+  backend: ["nodejs", "spring", "django", "flask", "express", "fastapi", "rails", "nestjs", "gin", "phoenix"],
+  cloud: ["aws", "gcp", "azure", "lambda", "serverless"],
+  ml: ["machine_learning", "deep_learning", "tensorflow", "pytorch", "sklearn", "scikit", "langchain"],
+  data: ["sql", "postgres", "postgresql", "mysql", "mongodb", "dynamodb", "cassandra", "redis"],
+  infra: ["docker", "kubernetes", "terraform", "ansible", "helm", "jenkins", "linux"],
+  mobile: ["flutter", "swift", "kotlin", "dart", "react"],
+  testing: ["jest", "pytest", "cypress", "playwright", "selenium", "vitest"],
 };
 
 function getSkillFamily(skill: string): string | null {
@@ -936,9 +971,18 @@ function computeResumeFitScore(job: DashboardJobRecord, profile: UserProfile): n
     termFrequency.set(term, (termFrequency.get(term) ?? 0) + 1);
   }
 
-  const normalizedTerms = rawJobTerms.slice(0, 120);
-  const uniqueTerms = Array.from(new Set(normalizedTerms));
-  const jobTerms = uniqueTerms.slice(0, 80);
+  // Sort unique terms: skill-type first (so recognized skills are never dropped),
+  // then by descending frequency (repeated terms signal importance). Prevents
+  // positional bias where skills in the Requirements section get cut off.
+  const jobTerms = Array.from(termFrequency.entries())
+    .sort(([a, af], [b, bf]) => {
+      const aIsSkill = KNOWN_SKILL_TERMS.has(a) ? 1 : 0;
+      const bIsSkill = KNOWN_SKILL_TERMS.has(b) ? 1 : 0;
+      if (aIsSkill !== bIsSkill) return bIsSkill - aIsSkill;
+      return bf - af;
+    })
+    .map(([term]) => term)
+    .slice(0, 80);
   if (!jobTerms.length) return 0;
 
   const profileTextTerms = new Set(tokenizeFitTerms(profile.resumeText ?? ""));

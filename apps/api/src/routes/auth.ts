@@ -1,11 +1,9 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { prisma } from "../db/prisma.js";
-import { signAccessToken, type AuthClaims } from "../auth/jwt.js";
+import { signAccessToken, authRequired } from "../auth/jwt.js";
 import { encryptString, decryptString } from "../security/encryption.js";
-import { env } from "../config/env.js";
 
 const RegisterSchema = z.object({
   email: z.string().email(),
@@ -31,15 +29,16 @@ export function createAuthRouter(): Router {
   router.post("/register", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const input = RegisterSchema.parse(req.body);
+
+      const existing = await prisma.user.findUnique({ where: { email: input.email } });
+      if (existing) {
+        res.status(409).json({ message: "An account with this email already exists" });
+        return;
+      }
+
       const passwordHash = await bcrypt.hash(input.password, 12);
-      const user = await prisma.user.upsert({
-        where: { email: input.email },
-        update: {
-          passwordHash,
-          firstName: input.firstName,
-          lastName: input.lastName
-        },
-        create: {
+      const user = await prisma.user.create({
+        data: {
           email: input.email,
           passwordHash,
           firstName: input.firstName,
@@ -76,16 +75,9 @@ export function createAuthRouter(): Router {
     }
   });
 
-  router.get("/me", async (req: Request, res: Response, next: NextFunction) => {
+  router.get("/me", authRequired, async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const header = req.headers.authorization;
-      if (!header?.startsWith("Bearer ")) {
-        res.status(401).json({ message: "Missing bearer token" });
-        return;
-      }
-      const token = header.slice(7);
-      const claims = jwt.verify(token, env.jwtSecret) as AuthClaims;
-      const user = await prisma.user.findUnique({ where: { id: claims.sub } });
+      const user = await prisma.user.findUnique({ where: { id: req.user!.id } });
       if (!user) {
         res.status(404).json({ message: "User not found" });
         return;
@@ -96,20 +88,9 @@ export function createAuthRouter(): Router {
     }
   });
 
-  router.post("/credentials", async (req: Request, res: Response, next: NextFunction) => {
+  router.post("/credentials", authRequired, async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const auth = req.headers.authorization;
-      if (!auth?.startsWith("Bearer ")) {
-        res.status(401).json({ message: "Missing bearer token" });
-        return;
-      }
-
-      const userId = req.headers["x-user-id"] as string | undefined;
-      if (!userId) {
-        res.status(400).json({ message: "x-user-id header required" });
-        return;
-      }
-
+      const userId = req.user!.id;
       const input = CredentialSchema.parse(req.body);
       const encryptedPassword = encryptString(input.password);
 
@@ -138,13 +119,9 @@ export function createAuthRouter(): Router {
     }
   });
 
-  router.get("/credentials/:provider", async (req: Request, res: Response, next: NextFunction) => {
+  router.get("/credentials/:provider", authRequired, async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const userId = req.headers["x-user-id"] as string | undefined;
-      if (!userId) {
-        res.status(400).json({ message: "x-user-id header required" });
-        return;
-      }
+      const userId = req.user!.id;
 
       const record = await prisma.integrationCredential.findUnique({
         where: {
