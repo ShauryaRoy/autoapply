@@ -39,10 +39,22 @@ try {
 } catch(e) {}
 `;
 
-const WEBVIEW_OPTION_SELECTOR = "[role='option']:not([aria-disabled='true']),[class*='__option']:not([class*='--is-disabled']),[class*='-option']:not([class*='-disabled'])";
+// Broad selector for dropdown options — covers React Select, Workday, Lever, Ashby, Greenhouse and raw li-based menus.
+// Token filtering (WEBVIEW_SNAPSHOT_ATTR) is the primary isolation mechanism; this selector intentionally casts wide.
+const WEBVIEW_OPTION_SELECTOR = "[role='option'],[role='menuitem'],[role='listitem'],[class*='__option'],[class*='-option'],[class*='Option'],[class*='dropdown-item'],[class*='menu-item'],[data-value],li";
 const WEBVIEW_SNAPSHOT_ATTR = "data-autoapply-before";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const randomBetween = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+type ExtractedField = {
+  selector: string;
+  label: string;
+  fieldType: "text" | "textarea" | "select" | "custom-select";
+  options: string[];
+  suggestedValue: string;
+  existingValue: string;
+};
 
 export function LiveAutomationPreview({ jobUrl, profile, generatedAnswers, onProfileUpdate }: LiveAutomationPreviewProps) {
   const [address, setAddress] = useState("");
@@ -248,6 +260,426 @@ try {
 })()`;
     return runInWebview(script, 15000, "locateForm") as Promise<{ clicked: boolean; fields: number; message: string } | null>;
   };
+
+  // ── EXTRACT: scan all form fields and return metadata (NO filling) ──────
+  const extractFormFields = async (): Promise<ExtractedField[] | null> => {
+    const p = profileRef.current;
+    const ga = answersRef.current;
+    const payload = {
+      firstName: p.firstName ?? "", lastName: p.lastName ?? "", email: p.email ?? "",
+      phone: p.phone ?? "", location: p.location ?? "",
+      linkedIn: p.linkedIn ?? p.links?.linkedin ?? "",
+      github: p.links?.github ?? "",
+      portfolio: p.portfolio ?? p.links?.portfolio ?? "",
+      whyCompany: p.whyCompany ?? ga.find((a) => a.prompt.toLowerCase().includes("why"))?.answer ?? "",
+      yearsExperience: String(p.yearsExperience ?? ""),
+      answers: ga.map((a) => ({ prompt: a.prompt, answer: a.answer })),
+      savedAnswers: p.answers ?? {},
+    };
+    let b64Json: string;
+    try {
+      b64Json = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    } catch (encErr) {
+      console.error('[AutoApply:extractFields] encoding FAILED', encErr);
+      return null;
+    }
+
+    const script = `
+(function() {
+${CSS_ESCAPE_POLYFILL}
+try {
+  var b64 = "${b64Json}";
+  var data = JSON.parse(decodeURIComponent(escape(atob(b64))));
+  var norm = function(v) { return String(v || "").toLowerCase().trim(); };
+  var tr = function(v) { return String(v || "").trim(); };
+  var savedAnswers = data.savedAnswers || {};
+
+  var byPrompt = function(label) {
+    var key = norm(label); if (!key || key.length < 6) return "";
+    if (savedAnswers[label]) return tr(savedAnswers[label]);
+    var lower = label.toLowerCase();
+    var sk = Object.keys(savedAnswers);
+    for (var i = 0; i < sk.length; i++) {
+      if (norm(sk[i]).includes(lower) || lower.includes(norm(sk[i]))) return tr(savedAnswers[sk[i]]);
+    }
+    var keyWords = key.split(/\\s+/).filter(function(w) { return w.length > 3; });
+    if (keyWords.length < 2) return "";
+    for (var ai = 0; ai < (data.answers || []).length; ai++) {
+      var item = data.answers[ai];
+      var prompt = norm(item.prompt); if (!prompt || prompt.length < 6) continue;
+      var pw = prompt.split(/\\s+/).filter(function(w) { return w.length > 3; });
+      var overlap = 0;
+      for (var wi = 0; wi < keyWords.length; wi++) { if (pw.indexOf(keyWords[wi]) >= 0) overlap++; }
+      if (overlap >= 2) return tr(item.answer);
+    }
+    return "";
+  };
+
+  var fieldValue = function(label) {
+    var key = norm(label); if (!key) return "";
+    if (key.includes("first name") || key === "first") return tr(data.firstName);
+    if (key.includes("last name") || key === "last" || key.includes("surname")) return tr(data.lastName);
+    if (key.includes("full name") || key === "name") return tr((data.firstName + " " + data.lastName).trim());
+    if (key.includes("email")) return tr(data.email);
+    if (key.includes("phone") || key.includes("mobile") || key.includes("telephone")) return tr(data.phone);
+    if (key.includes("linkedin")) return tr(data.linkedIn);
+    if (key.includes("github")) return tr(data.github);
+    if (key.includes("portfolio") || key.includes("personal website") || key.includes("website url")) return tr(data.portfolio || data.github || data.linkedIn);
+    if ((key.includes("city") || key.includes("where are you based") || (/\\blocation\\b/.test(key) && !key.includes("relocation")) || (/\\baddress\\b/.test(key) && !key.includes("ip address"))) && !key.includes("hispanic") && !key.includes("ethnic") && !key.includes("race")) return tr(data.location);
+    if (key.includes("years") && key.includes("experience")) return tr(data.yearsExperience || "3");
+    if (key.includes("why") && (key.includes("company") || key.includes("us") || key.includes("interest"))) return tr(data.whyCompany || byPrompt(label));
+    if (key.includes("cover letter") || key.includes("covering letter")) return tr(data.whyCompany || byPrompt(label));
+    if ((key.includes("sponsor") || key.includes("visa")) && (key.includes("require") || key.includes("need") || key.includes("will you"))) return "No";
+    if ((key.includes("authoriz") || key.includes("eligible") || key.includes("right to work") || key.includes("legally permitted")) && !key.includes("ethnic") && !key.includes("hispanic")) return "Yes";
+    if (key.includes("open to relocation") || key.includes("willing to relocate") || key.includes("relocate for")) return "Yes";
+    if (key.includes("open to working in-person") || key.includes("open to working in person") || key.includes("work on-site") || key.includes("work onsite") || key.includes("hybrid")) return "Yes";
+    if (key.includes("interviewed") && key.includes("before")) return "No";
+    if (key.includes("hispanic") || key.includes("latino") || key.includes("ethnic") || key.includes("race") || key.includes("gender") || key.includes("veteran") || key.includes("disabilit") || key.includes("lgbtq") || key.includes("pronounc")) return "";
+    if (key.includes("how did you hear") || key.includes("referral") || key.includes("referred by")) return "";
+    return byPrompt(label);
+  };
+
+  var getDocs = function() {
+    var docs = [document];
+    var frames = Array.from(document.querySelectorAll("iframe"));
+    for (var i = 0; i < frames.length; i++) { try { if (frames[i].contentDocument && frames[i].contentDocument.body) docs.push(frames[i].contentDocument); } catch(e) {} }
+    return docs;
+  };
+  var isVis = function(el, view) {
+    try { var s = (view || window).getComputedStyle(el); var r = el.getBoundingClientRect();
+      return s.display !== "none" && s.visibility !== "hidden" && r.width > 0 && r.height > 0; } catch(e) { return false; }
+  };
+  var cleanLabel = function(raw) {
+    if (!raw) return "";
+    return String(raw).replace(/[*\u2022]+/g, "").replace(/(\\s*(required|optional|mandatory)\\s*)/gi, " ").replace(/\\s+/g, " ").replace(/\\n+/g, " ").trim();
+  };
+  var getBestLabel = function(el, doc) {
+    try {
+      var SKIP_TEXT = /^(select\\b|choose\\b|pick\\b|none\\b|-{2,}|_{2,}|enter\\b.*answer|your answer|type here)/i;
+      var al = el.getAttribute("aria-label"); if (al) { var alC = cleanLabel(al); if (alC.length > 2 && !/^(select|choose|pick|none)\\b/i.test(alC)) return alC; }
+      var labelledBy = el.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        var ids = labelledBy.trim().split(/\\s+/); var parts = [];
+        for (var li = 0; li < ids.length; li++) { try { var ref = doc.getElementById(ids[li]); if (ref) { var rt = (ref.innerText || ref.textContent || "").trim(); if (rt) parts.push(rt); } } catch(e2) {} }
+        if (parts.length > 0) { var joined = cleanLabel(parts.join(" ")); if (joined.length > 2 && !SKIP_TEXT.test(joined)) return joined; }
+      }
+      var eid = el.id;
+      if (eid) { var lbl = doc.querySelector("label[for=" + JSON.stringify(eid) + "]"); if (lbl) { var c = lbl.cloneNode(true); try { c.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); } catch(e3) {} var t = cleanLabel(c.textContent); if (t.length > 2) return t; } }
+      var wrapped = el.closest("label");
+      if (wrapped) { var c2 = wrapped.cloneNode(true); try { c2.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); } catch(e4) {} var t2 = cleanLabel(c2.textContent); if (t2.length > 2) return t2; }
+      var fs = el.closest("fieldset"); if (fs) { var leg = fs.querySelector("legend"); if (leg) { var lt = cleanLabel(leg.textContent); if (lt.length > 2) return lt; } }
+      var pathEl = el;
+      for (var dd = 0; dd < 6; dd++) {
+        var par2 = pathEl.parentElement; if (!par2) break;
+        var sibs2 = []; var cnodes = Array.from(par2.childNodes);
+        for (var cj = 0; cj < cnodes.length; cj++) {
+          var cn = cnodes[cj];
+          if (cn === pathEl || (cn.nodeType === 1 && typeof cn.contains === "function" && cn.contains(pathEl))) continue;
+          var ctg2 = cn.nodeType === 1 ? ((cn.tagName || "").toLowerCase()) : "";
+          if (ctg2 && /^(script|style|input|select|textarea|button)$/.test(ctg2)) continue;
+          var ctt = ((cn.innerText || cn.textContent) || "").trim();
+          if (ctt && ctt.length >= 2 && ctt.length <= 200) sibs2.push(ctt);
+        }
+        var combined2 = cleanLabel(sibs2.join(" "));
+        if (combined2.length > 3 && combined2.length < 200 && !SKIP_TEXT.test(combined2)) return combined2;
+        pathEl = par2;
+      }
+      var ph = el.getAttribute("placeholder"); var phClean = ph ? cleanLabel(ph) : "";
+      if (phClean.length > 2 && !/^(select|choose|pick|none)\\b/i.test(phClean) && !/^-{2,}/.test(phClean) && !/^_{2,}/.test(phClean)) return phClean;
+      var nm = el.getAttribute("name"); if (nm && cleanLabel(nm).length > 2) return cleanLabel(nm).replace(/[_\\-]/g, " ");
+      return "";
+    } catch(e) { return ""; }
+  };
+  var getUniqueSelector = function(el) {
+    try {
+      if (el.id) return "#" + CSS.escape(el.id);
+      var n = el.getAttribute("name"); if (n) return el.tagName.toLowerCase() + "[name=" + JSON.stringify(n) + "]";
+      var td = el.getAttribute("data-testid"); if (td) return "[data-testid=" + JSON.stringify(td) + "]";
+      var path = []; var cur = el;
+      while (cur && cur.nodeType === 1 && cur.tagName !== "BODY" && cur.tagName !== "HTML") {
+        var seg = cur.nodeName.toLowerCase();
+        if (cur.id) { path.unshift("#" + CSS.escape(cur.id)); break; }
+        var rawCls = typeof cur.className === "string" ? cur.className.trim().split(/\\s+/).filter(function(c) { return c && /^[a-zA-Z_\\-][a-zA-Z0-9_\\-]*$/.test(c); }).slice(0, 2) : [];
+        if (rawCls.length > 0) seg += "." + rawCls.join(".");
+        var parent = cur.parentNode;
+        if (parent && parent.children) { var sibs = Array.from(parent.children).filter(function(e) { return e.nodeName === cur.nodeName; }); if (sibs.length > 1) seg += ":nth-of-type(" + (sibs.indexOf(cur) + 1) + ")"; }
+        path.unshift(seg);
+        cur = cur.parentNode;
+        if (path.length >= 8) break;
+      }
+      return path.length > 0 ? path.join(" > ") : el.tagName.toLowerCase();
+    } catch(e) { return el.tagName ? el.tagName.toLowerCase() : "unknown"; }
+  };
+  var isCustom = function(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    try { if (el.closest("[role='combobox']")) return true; if (el.closest("[class*='__control']")) return true; if (el.closest("[class*='react-select__']")) return true; } catch(e) {}
+    return false;
+  };
+  var isPhonePicker = function(el) {
+    var ni = ((el.getAttribute("name") || "") + " " + (el.id || "")).toLowerCase();
+    if (/country.?code|dial.?code|phone.?country|calling.?code/.test(ni)) return true;
+    var ac = el.getAttribute("autocomplete") || "";
+    if (ac === "tel-country-code" || ac === "country-calling-code") return true;
+    // Protect the actual phone NUMBER input: tel-type means it is the number field, not the country picker
+    if (el.tagName === "INPUT" && (el.type === "tel" || ac === "tel" || ac === "tel-national" || ac === "tel-local")) return false;
+    try { if (el.closest("[class*='flag-dropdown'],[class*='iti__flag'],[class*='PhoneInputCountry'],[class*='react-phone'],[class*='phone-input'],[class*='intl-tel']")) return true; } catch(e) {}
+    if (el.tagName === "SELECT") { try { var optTexts = Array.from(el.options).slice(0, 8).map(function(o) { return (o.text || "").trim(); }); var ccCount = 0; for (var pi = 0; pi < optTexts.length; pi++) { if (/\\+\\d{1,4}$/.test(optTexts[pi]) || /^\\+\\d/.test(optTexts[pi])) ccCount++; } if (ccCount >= 3) return true; } catch(e) {} }
+    return false;
+  };
+
+  var fields = []; var seen = {}; var docs = getDocs();
+  for (var di = 0; di < docs.length; di++) {
+    var doc = docs[di]; var view = doc.defaultView || window;
+    var candidates = Array.from(doc.querySelectorAll("input, textarea, select"));
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var el = candidates[ci];
+      try {
+        if (el.tagName === "INPUT" && /hidden|file|checkbox|radio|submit|button|reset|image/.test(el.type || "")) continue;
+        if (el.disabled || el.readOnly) continue;
+        if (!isVis(el, view)) continue;
+        if (isPhonePicker(el)) continue;
+        var sel = getUniqueSelector(el);
+        if (seen[sel]) continue; seen[sel] = true;
+        var rawLabel = getBestLabel(el, doc);
+        var label = cleanLabel(rawLabel);
+        var val = fieldValue(label);
+        var existing = tr(el.value || "");
+        if (isCustom(el)) {
+          var clbl = (label && label.length >= 3) ? label : ("Dropdown " + (fields.length + 1));
+          fields.push({ selector: sel, label: clbl, fieldType: "custom-select", options: [], suggestedValue: fieldValue(clbl) || "", existingValue: existing });
+          continue;
+        }
+        var ft = el.tagName === "SELECT" ? "select" : (el.tagName === "TEXTAREA" ? "textarea" : "text");
+        var opts = el.tagName === "SELECT" ? Array.from(el.options).map(function(o) { return (o.text || "").trim(); }).filter(Boolean) : [];
+        var effectiveLbl = (label && label.length >= 3) ? label : ("Field " + (fields.length + 1));
+        fields.push({ selector: sel, label: effectiveLbl, fieldType: ft, options: opts, suggestedValue: val || "", existingValue: existing });
+      } catch(e) {}
+    }
+    // Extra: div/button comboboxes without an inner <input>
+    var combos = Array.from(doc.querySelectorAll("[role='combobox'],[aria-haspopup='listbox']"));
+    for (var ki = 0; ki < combos.length; ki++) {
+      var cel = combos[ki]; if (!cel) continue;
+      try {
+        var ctag = cel.tagName.toLowerCase();
+        if (ctag === "input" || ctag === "select") continue;
+        if (cel.querySelector("input:not([type='hidden']), select")) continue;
+        if (!isVis(cel, view)) continue;
+        var csel = getUniqueSelector(cel);
+        if (seen[csel]) continue; seen[csel] = true;
+        var clabel = cleanLabel(getBestLabel(cel, doc));
+        if (!clabel || clabel.length < 3) clabel = "Dropdown " + (fields.length + 1);
+        fields.push({ selector: csel, label: clabel, fieldType: "custom-select", options: [], suggestedValue: fieldValue(clabel) || "", existingValue: "" });
+      } catch(e) {}
+    }
+  }
+  var seenSel = {};
+  return fields.filter(function(f) { if (!f.selector || seenSel[f.selector]) return false; seenSel[f.selector] = true; return true; });
+} catch(topErr) { return []; }
+})()`;
+
+    const result = await runInWebview(script, 15000, "extractFields");
+    return Array.isArray(result) ? result as ExtractedField[] : null;
+  };
+
+  // ── HUMAN-LIKE INTERACTION HELPERS ──────────────────────────────────────
+
+  // Returns viewport-center coordinates of an element for trusted input events.
+  const getElementCenter = async (selector: string, findContainer = false): Promise<{ x: number; y: number } | null> => {
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+    const findContainerJs = findContainer ? "true" : "false";
+    const script = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (!el) return null;
+  var target = el;
+  if (${findContainerJs}) {
+    target = el.closest("[role='combobox']") || el.closest("[aria-haspopup='listbox']") || el.closest("[class*='__control']") || el.closest("[class*='SelectControl']") || el.parentElement || el;
+  }
+  target.scrollIntoView({ behavior: 'instant', block: 'center' });
+  var r = target.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return null;
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+} catch(e) { return null; }
+})()`;
+    return await runInWebview(script, 5000, "getCenter");
+  };
+
+  // Sends a REAL trusted OS-level click via Electron webview.sendInputEvent().
+  // isTrusted=true — bypasses the check that blocks JS-dispatched events on modern ATS.
+  const realClickAt = async (x: number, y: number): Promise<boolean> => {
+    const node = webviewRef.current;
+    if (!node || typeof node.sendInputEvent !== "function") return false;
+    try {
+      node.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1, modifiers: [] });
+      await sleep(randomBetween(40, 80));
+      node.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1, modifiers: [] });
+      return true;
+    } catch (e) {
+      console.warn("[AutoApply:realClick] sendInputEvent failed:", e);
+      return false;
+    }
+  };
+
+  const humanScrollToField = async (selector: string): Promise<boolean> => {
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+    const script = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  return true;
+} catch(e) { return false; }
+})()`;
+    return (await runInWebview(script, 5000, "humanScroll")) === true;
+  };
+
+  // Highlights the combobox CONTAINER (not the inner input) so custom dropdowns are visibly outlined.
+  const humanHighlightField = async (selector: string, on: boolean): Promise<void> => {
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+    const script = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  var target = el.closest("[role='combobox']") || el.closest("[class*='__control']") || el.closest("[class*='SelectControl']") || el;
+  target.style.outline = ${on ? "'2px solid #3b82f6'" : "''"};
+  target.style.outlineOffset = ${on ? "'2px'" : "''"};
+  return true;
+} catch(e) { return false; }
+})()`;
+    await runInWebview(script, 3000, "humanHighlight");
+  };
+
+  const humanTypeInField = async (selector: string, value: string): Promise<boolean> => {
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+
+    // Step 1: Focus, click, and clear existing value
+    const clearScript = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  el.focus();
+  el.click();
+  try { var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, ''); else el.value = ''; } catch(e) { el.value = ''; }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  return true;
+} catch(e) { return false; }
+})()`;
+    const cleared = await runInWebview(clearScript, 5000, "humanClear");
+    if (!cleared) return false;
+
+    await sleep(randomBetween(200, 500)); // thinking pause
+
+    // Step 2: Type each character one by one
+    let burstCounter = randomBetween(5, 12);
+    for (let i = 0; i < value.length; i++) {
+      const textSoFar = value.substring(0, i + 1);
+      const textB64 = btoa(unescape(encodeURIComponent(textSoFar)));
+
+      const charScript = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  var text = decodeURIComponent(escape(atob("${textB64}")));
+  try { var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, text); else el.value = text; } catch(e) { el.value = text; }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  return true;
+} catch(e) { return false; }
+})()`;
+      const typed = await runInWebview(charScript, 3000, "humanChar");
+      if (!typed) return false;
+
+      // Natural typing delay
+      const char = value[i];
+      let delay = randomBetween(35, 95);
+      if (char === ' ' || /[.,!?;:\-]/.test(char)) delay += randomBetween(40, 120);
+      burstCounter--;
+      if (burstCounter <= 0) {
+        delay += randomBetween(150, 400);
+        burstCounter = randomBetween(5, 12);
+      }
+      // Speed up slightly for very long text
+      if (i > 80) delay = Math.max(15, delay - 30);
+      await sleep(delay);
+    }
+
+    // Step 3: Blur with change event
+    const blurScript = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var el = document.querySelector(sel);
+  if (el) { el.dispatchEvent(new Event('change', { bubbles: true })); el.blur(); }
+  return true;
+} catch(e) { return false; }
+})()`;
+    await runInWebview(blurScript, 3000, "humanBlur");
+    return true;
+  };
+
+  // Native <select>: DO NOT el.click() — that opens the OS picker which JS cannot control.
+  // Instead set .value directly with the React/Vue-compatible descriptor trick.
+  const humanSelectNativeOption = async (selector: string, value: string): Promise<boolean> => {
+    await humanScrollToField(selector);
+    await sleep(randomBetween(200, 350));
+
+    const selB64 = btoa(unescape(encodeURIComponent(selector)));
+    const valB64 = btoa(unescape(encodeURIComponent(value)));
+    const script = `(function(){
+try {
+  var sel = decodeURIComponent(escape(atob("${selB64}")));
+  var val = decodeURIComponent(escape(atob("${valB64}")));
+  var el = document.querySelector(sel);
+  if (!el || el.tagName !== 'SELECT') return false;
+  var opts = Array.from(el.options);
+  var lower = String(val || '').toLowerCase().trim();
+  var best = null; var bestScore = 0;
+  for (var i = 0; i < opts.length; i++) {
+    var t = String(opts[i].textContent || '').toLowerCase().trim();
+    var sc = 0;
+    if (t === lower) sc = 100;
+    else if (t.startsWith(lower) || lower.startsWith(t)) sc = 80;
+    else if (t.includes(lower) || lower.includes(t)) sc = 60;
+    if (sc > bestScore) { best = opts[i]; bestScore = sc; }
+  }
+  if (!best || bestScore < 60) return false;
+  el.focus();
+  try { var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, best.value); else el.value = best.value; } catch(e) { el.value = best.value; }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.blur();
+  return true;
+} catch(e) { return false; }
+})()`;
+    const result = await runInWebview(script, 5000, "humanSelectNative");
+    await sleep(randomBetween(200, 400));
+    return result === true;
+  };
+
+  const humanFillCustomDropdown = async (selector: string, value: string): Promise<boolean> => {
+    // Step 1: Open dropdown with human-like click
+    const opened = await openCustomDropdownInWebview(selector);
+    if (!opened) return false;
+
+    // Step 2: Pause to "read" the options
+    await sleep(randomBetween(600, 1200));
+
+    // Step 3: Select the matching option
+    const matched = await selectCustomDropdownOptionInWebview(opened.resolvedSelector, opened.token, value);
+    if (!matched) {
+      await closeCustomDropdownInWebview(opened.resolvedSelector, opened.token);
+      return false;
+    }
+
+    // Step 4: Close with a natural pause
+    await sleep(randomBetween(200, 400));
+    await closeCustomDropdownInWebview(opened.resolvedSelector, opened.token);
+    return true;
+  };
+
   // ── FILL: fill all visible form fields with profile data ────────────────
   const fillForm = async (): Promise<{ filled: number; unfilled: UnfilledField[]; message: string } | null> => {
     const p = profileRef.current;
@@ -337,27 +769,103 @@ try {
     try { var s = (view || window).getComputedStyle(el); var r = el.getBoundingClientRect();
       return s.display !== "none" && s.visibility !== "hidden" && r.width > 0 && r.height > 0; } catch(e) { return false; }
   };
-  var getLabel = function(el, doc) {
+  // Cleans a raw label string: collapses whitespace, strips asterisks/bullets, trims.
+  var cleanLabel = function(raw) {
+    if (!raw) return "";
+    return String(raw)
+      .replace(/[*•]+/g, "")
+      .replace(/(\\s*(required|optional|mandatory)\\s*)/gi, " ")
+      .replace(/\\s+/g, " ")
+      .replace(/\\n+/g, " ")
+      .trim();
+  };
+  // getBestLabel: robust label extraction covering aria-labelledby, DOM traversal,
+  // and parent sibling text nodes — handles Workday, Ashby, Greenhouse, Lever etc.
+  var getBestLabel = function(el, doc) {
     try {
-      var al = el.getAttribute("aria-label"); if (al) return tr(al);
-      var id = el.id;
-      if (id) {
-        var lbl = doc.querySelector("label[for=" + JSON.stringify(id) + "]");
-        if (lbl) { var c = lbl.cloneNode(true); c.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); var t = tr(c.textContent); if (t) return t; }
+      // Pattern for generic placeholder text that should never be returned as a label.
+      var SKIP_TEXT = /^(select\b|choose\b|pick\b|none\b|-{2,}|_{2,}|enter\b.*answer|your answer|type here)/i;
+      // 1. aria-label (skip generic placeholder-style aria-labels like "Select...")
+      var al = el.getAttribute("aria-label"); if (al) { var alC = cleanLabel(al); if (alC.length > 2 && !/^(select|choose|pick|none)\b/i.test(alC)) return alC; }
+      // 2. aria-labelledby → dereference the linked element
+      var labelledBy = el.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        var ids = labelledBy.trim().split(/\\s+/);
+        var parts = [];
+        for (var li = 0; li < ids.length; li++) {
+          try { var ref = doc.getElementById(ids[li]); if (ref) { var rt = (ref.innerText || ref.textContent || "").trim(); if (rt) parts.push(rt); } } catch(e2) {}
+        }
+        if (parts.length > 0) { var joined = cleanLabel(parts.join(" ")); if (joined.length > 2 && !SKIP_TEXT.test(joined)) return joined; }
       }
+      // 3. <label for=id> (clone to strip nested inputs from text)
+      var eid = el.id;
+      if (eid) {
+        var lbl = doc.querySelector("label[for=" + JSON.stringify(eid) + "]");
+        if (lbl) { var c = lbl.cloneNode(true); try { c.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); } catch(e3) {} var t = cleanLabel(c.textContent); if (t.length > 2) return t; }
+      }
+      // 4. parent <label> wrapper (clone to strip nested inputs)
       var wrapped = el.closest("label");
-      if (wrapped) { var c2 = wrapped.cloneNode(true); c2.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); var t2 = tr(c2.textContent); if (t2) return t2; }
-      var fs = el.closest("fieldset"); if (fs) { var leg = fs.querySelector("legend"); if (leg) return tr(leg.textContent); }
-      return tr(el.getAttribute("placeholder") || el.getAttribute("name") || el.id || "");
+      if (wrapped) { var c2 = wrapped.cloneNode(true); try { c2.querySelectorAll("input,select,textarea,button").forEach(function(x) { x.remove(); }); } catch(e4) {} var t2 = cleanLabel(c2.textContent); if (t2.length > 2) return t2; }
+      // 5. fieldset legend
+      var fs = el.closest("fieldset"); if (fs) { var leg = fs.querySelector("legend"); if (leg) { var lt = cleanLabel(leg.textContent); if (lt.length > 2) return lt; } }
+      // 6-7. Sibling-of-path DOM walk: at each ancestor level collect text from ALL children
+      //       EXCEPT the child that is on the path to el. This is the key fix — it prevents
+      //       el's own rendered text (e.g. "Select..." inside a combobox) from being read back
+      //       as the label. Climbs up to 6 levels to find cousin labels (Workday, Ashby, etc.).
+      //       ALSO: if collected text looks like a generic placeholder (e.g. "Select...") skip
+      //       that level and keep climbing — the real label is further up the tree.
+      var pathEl = el;
+      for (var dd = 0; dd < 6; dd++) {
+        var par2 = pathEl.parentElement;
+        if (!par2) break;
+        var sibs2 = [];
+        var cnodes = Array.from(par2.childNodes);
+        for (var cj = 0; cj < cnodes.length; cj++) {
+          var cn = cnodes[cj];
+          // Skip the subtree that contains el — its text is NOT the label
+          if (cn === pathEl || (cn.nodeType === 1 && typeof cn.contains === "function" && cn.contains(pathEl))) continue;
+          var ctg2 = cn.nodeType === 1 ? ((cn.tagName || "").toLowerCase()) : "";
+          if (ctg2 && /^(script|style|input|select|textarea|button)$/.test(ctg2)) continue;
+          var ctt = ((cn.innerText || cn.textContent) || "").trim();
+          if (ctt && ctt.length >= 2 && ctt.length <= 200) sibs2.push(ctt);
+        }
+        var combined2 = cleanLabel(sibs2.join(" "));
+        // Skip generic placeholder text (e.g. react-select __placeholder div) — keep climbing
+        if (combined2.length > 3 && combined2.length < 200 && !SKIP_TEXT.test(combined2)) return combined2;
+        pathEl = par2;
+      }
+      // 8. placeholder — reject generic non-label placeholders like "Select...", "Choose..."
+      var ph = el.getAttribute("placeholder"); var phClean = ph ? cleanLabel(ph) : "";
+      if (phClean.length > 2 && !/^(select|choose|pick|none)\b/i.test(phClean) && !/^-{2,}/.test(phClean) && !/^_{2,}/.test(phClean)) return phClean;
+      // 9. name attribute
+      var nm = el.getAttribute("name"); if (nm && cleanLabel(nm).length > 2) return cleanLabel(nm).replace(/[_\\-]/g, " ");
+      return "";
     } catch(e) { return ""; }
   };
-  var buildSel = function(el, idx) {
+  // Returns a unique, stable CSS selector for an element.
+  // Priority: id → name attr → data-testid → full ancestor path with class+nth-of-type.
+  var getUniqueSelector = function(el) {
     try {
       if (el.id) return "#" + CSS.escape(el.id);
       var n = el.getAttribute("name"); if (n) return el.tagName.toLowerCase() + "[name=" + JSON.stringify(n) + "]";
       var td = el.getAttribute("data-testid"); if (td) return "[data-testid=" + JSON.stringify(td) + "]";
-    } catch(e) {}
-    return el.tagName.toLowerCase() + ":nth-of-type(" + (idx + 1) + ")";
+      var path = []; var cur = el;
+      while (cur && cur.nodeType === 1 && cur.tagName !== "BODY" && cur.tagName !== "HTML") {
+        var seg = cur.nodeName.toLowerCase();
+        if (cur.id) { path.unshift("#" + CSS.escape(cur.id)); break; }
+        var rawCls = typeof cur.className === "string" ? cur.className.trim().split(/\\s+/).filter(function(c) { return c && /^[a-zA-Z_\\-][a-zA-Z0-9_\\-]*$/.test(c); }).slice(0, 2) : [];
+        if (rawCls.length > 0) seg += "." + rawCls.join(".");
+        var parent = cur.parentNode;
+        if (parent && parent.children) {
+          var sibs = Array.from(parent.children).filter(function(e) { return e.nodeName === cur.nodeName; });
+          if (sibs.length > 1) seg += ":nth-of-type(" + (sibs.indexOf(cur) + 1) + ")";
+        }
+        path.unshift(seg);
+        cur = cur.parentNode;
+        if (path.length >= 8) break;
+      }
+      return path.length > 0 ? path.join(" > ") : el.tagName.toLowerCase();
+    } catch(e) { return el.tagName ? el.tagName.toLowerCase() : "unknown"; }
   };
   var setVal = function(el, v) {
     try { var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value"); if (d && d.set) d.set.call(el, v); else el.value = v; } catch(e) { el.value = v; }
@@ -421,7 +929,7 @@ try {
         if (!(el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT")) continue;
         if (!isVis(el, view)) continue; if (isCustom(el)) continue;
         var existing = tr(el.value || ""); if (existing && existing.length > 1) continue;
-        var sel = buildSel(el, 0); if (seen[sel]) continue; seen[sel] = true;
+        var sel = getUniqueSelector(el); if (seen[sel]) continue; seen[sel] = true;
         if (el.tagName === "SELECT") { if (fillSel(el, item.val)) filled++; } else { if (fillField(el, item.val)) filled++; }
       } catch(e) {}
     }
@@ -435,16 +943,19 @@ try {
       try {
         if (el.tagName === "INPUT" && /hidden|file|checkbox|radio|submit|button|reset|image/.test(el.type || "")) continue;
         if (el.disabled || el.readOnly) continue; if (!isVis(el, view)) continue; if (isPhonePicker(el)) continue;
-        var sel = buildSel(el, ci); if (seen[sel]) continue; seen[sel] = true;
-        var label = getLabel(el, doc); var val = fieldValue(label);
+        var sel = getUniqueSelector(el); if (seen[sel]) continue; seen[sel] = true;
+        var rawLabel = getBestLabel(el, doc); var label = cleanLabel(rawLabel); var val = fieldValue(label);
+        console.log("[Label Debug]", JSON.stringify({ selector: sel, rawLabel: rawLabel, label: label, val: val ? val.slice(0,40) : "" }));
         if (isCustom(el)) {
           var con = el.closest("[class*='__control'],[class*='SelectControl'],[role='combobox']") || el.parentElement;
-          if (label && label.length >= 3) unfilled.push({ label: label, selector: sel, fieldType: "custom-select", options: getCustomOpts(con, el), autoValue: val || "" });
+          // Always add — fallback label so unlabelled dropdowns are NOT silently dropped.
+          var clblInner = (label && label.length >= 3) ? label : ("Dropdown " + (unfilled.length + 1));
+          unfilled.push({ label: clblInner, selector: sel, fieldType: "custom-select", options: getCustomOpts(con, el), autoValue: fieldValue(clblInner) || "" });
           continue;
         }
-        if (!val) { if (label && label.length >= 3) { var ft = el.tagName === "SELECT" ? "select" : (el.tagName === "TEXTAREA" ? "textarea" : "text"); var fo = el.tagName === "SELECT" ? Array.from(el.options).map(function(o) { return (o.text || "").trim(); }).filter(Boolean) : []; unfilled.push({ label: label, selector: sel, fieldType: ft, options: fo }); } continue; }
+        if (!val) { var ft = el.tagName === "SELECT" ? "select" : (el.tagName === "TEXTAREA" ? "textarea" : "text"); var fo = el.tagName === "SELECT" ? Array.from(el.options).map(function(o) { return (o.text || "").trim(); }).filter(Boolean) : []; var effectiveLbl = (label && label.length >= 3) ? label : ("Field " + (unfilled.length + 1)); unfilled.push({ label: effectiveLbl, selector: sel, fieldType: ft, options: fo, autoValue: "" }); continue; }
         if ((el.tagName === "INPUT" || el.tagName === "TEXTAREA") && tr(el.value || "") && tr(el.value || "").length > 1) continue;
-        if (el.tagName === "SELECT") { if (fillSel(el, val)) filled++; else if (label && label.length >= 3) { var fo2 = Array.from(el.options).map(function(o) { return (o.text || "").trim(); }).filter(Boolean); unfilled.push({ label: label, selector: sel, fieldType: "select", options: fo2 }); } } else { if (fillField(el, val)) filled++; }
+        if (el.tagName === "SELECT") { var fo2 = Array.from(el.options).map(function(o) { return (o.text || "").trim(); }).filter(Boolean); if (fillSel(el, val)) filled++; else { var fo2label = (label && label.length >= 3) ? label : ("Field " + (unfilled.length + 1)); unfilled.push({ label: fo2label, selector: sel, fieldType: "select", options: fo2, autoValue: val }); } } else { if (fillField(el, val)) filled++; }
       } catch(e) {}
     }
   }
@@ -458,10 +969,13 @@ try {
       try {
         var ctag = cel.tagName.toLowerCase();
         if (ctag === "input" || ctag === "select") continue;
-        if (cel.querySelector("input, select")) continue;
+        if (cel.querySelector("input:not([type='hidden']), select")) continue;
         if (!isVis(cel, view3)) continue;
-        var csel = buildSel(cel, 90000 + ki); if (seen[csel]) continue; seen[csel] = true;
-        var clabel = tr(cel.getAttribute("aria-label") || ""); if (!clabel) { var cfor = cel.id ? doc3.querySelector("label[for=" + JSON.stringify(cel.id) + "]") : null; if (cfor) clabel = tr(cfor.textContent); } if (!clabel || clabel.length < 3) continue;
+        var csel = getUniqueSelector(cel); if (seen[csel]) continue; seen[csel] = true;
+        var clabel = cleanLabel(getBestLabel(cel, doc3));
+        console.log("[Label Debug Combo]", JSON.stringify({ selector: csel, label: clabel }));
+        // Always add — fallback label so unlabelled comboboxes are NOT silently dropped.
+        if (!clabel || clabel.length < 3) clabel = "Dropdown " + (unfilled.length + 1);
         var cval = fieldValue(clabel);
         var ctrlId = cel.getAttribute("aria-controls") || cel.getAttribute("aria-owns") || "";
         var copts = [];
@@ -472,7 +986,9 @@ try {
     }
   }
 
-  var seenL = {}; var deduped = unfilled.filter(function(f) { var k = f.label.toLowerCase().trim(); if (!k || seenL[k]) return false; seenL[k] = true; return true; });
+  // Deduplicate by SELECTOR (not label) — multiple dropdowns can share a label but must have distinct selectors.
+  var seenSel = {}; var deduped = unfilled.filter(function(f) { if (!f.selector || seenSel[f.selector]) return false; seenSel[f.selector] = true; return true; });
+  console.log("[Unfilled Fields Debug]", JSON.stringify({ totalDetected: unfilled.length, afterDedup: deduped.length, autoAnswerCount: deduped.filter(function(f){return !!f.autoValue;}).length, noAnswerCount: deduped.filter(function(f){return !f.autoValue;}).length, fieldLabels: deduped.map(function(f){return f.label;}), filled: filled }));
   return { filled: filled, unfilled: deduped, message: "Filled " + filled + " field(s). " + deduped.length + " need your input." };
 } catch(topErr) {
   return { filled: 0, unfilled: [], message: "Fill error: " + (topErr && topErr.message ? topErr.message : String(topErr)) };
@@ -574,24 +1090,32 @@ try {
     return result?.mode ?? "missing";
   };
 
-  const openCustomDropdownInWebview = async (selector: string): Promise<string | null> => {
+  const openCustomDropdownInWebview = async (selector: string): Promise<{ token: string; resolvedSelector: string } | null> => {
     const token = `autoapply-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const safeSel = JSON.stringify(selector);
     const safeToken = JSON.stringify(token);
     const safeAttr = JSON.stringify(WEBVIEW_SNAPSHOT_ATTR);
-    // Correct order: 1) close any open dropdown, 2) snapshot current options, 3) open ours
-    const script = `
+    // Step A: close menus, snapshot option nodes, resolve selector, find trigger rect
+    const prepScript = `
 (function() {
 try {
   var ATTR = ${safeAttr};
-  // Step 1: close anything currently open
+  // Close any open dropdown
   try { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); } catch(e) {}
   try { document.body.click(); } catch(e) {}
 
-  var el = document.querySelector(${safeSel});
-  if (!el) return { opened: false };
+  var matches = document.querySelectorAll(${safeSel});
+  console.log("[Dropdown Open]", JSON.stringify({ selector: ${safeSel}, matchCount: matches.length }));
+  if (matches.length === 0) return { ok: false, reason: "no-match" };
+  var resolvedSel = ${safeSel};
+  if (matches.length !== 1) {
+    var autoId = "aa-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+    matches[0].setAttribute("data-auto-id", autoId);
+    resolvedSel = ${safeSel} + "[data-auto-id='" + autoId + "']";
+  }
+  var el = matches[0];
 
-  // Step 2: snapshot ALL current option-like nodes so we can detect newly rendered ones
+  // Snapshot all current option-like nodes
   try { document.querySelectorAll("[" + ATTR + "]").forEach(function(n) { n.removeAttribute(ATTR); }); } catch(e) {}
   var SNAP_SELS = [
     "[role='option']", "[role='menuitem']", "[role='listitem']",
@@ -602,7 +1126,34 @@ try {
     try { document.querySelectorAll(SNAP_SELS[si]).forEach(function(n) { if (!n.getAttribute(ATTR)) n.setAttribute(ATTR, ${safeToken}); }); } catch(e) {}
   }
 
-  // Step 3: find the trigger element and open with full mouse event sequence
+  // Find the trigger container and get its viewport coordinates
+  var con = el.closest("[role='combobox']") || el.closest("[aria-haspopup='listbox']") || el.closest("[class*='__control']") || el.closest("[class*='SelectControl']") || el.parentElement || el;
+  var trigger = con || el;
+  trigger.scrollIntoView({ behavior: 'instant', block: 'center' });
+  var r = trigger.getBoundingClientRect();
+  try { if (el.tagName === "INPUT" || el.tagName === "BUTTON") el.focus(); } catch(e) {}
+  return { ok: true, resolvedSel: resolvedSel, cx: Math.round(r.left + r.width / 2), cy: Math.round(r.top + r.height / 2) };
+} catch(e) {
+  return { ok: false, err: String(e.message || e) };
+}
+})()`;
+    const prep = await runInWebview(prepScript, 5000, "openDropdownPrep");
+    if (!prep?.ok) return null;
+
+    const resolvedSel = (prep.resolvedSel as string) || selector;
+
+    // Step B: Use REAL trusted click via Electron sendInputEvent, then JS dispatch fallback
+    let clicked = false;
+    if (typeof prep.cx === "number" && typeof prep.cy === "number") {
+      clicked = await realClickAt(prep.cx, prep.cy);
+    }
+    if (!clicked) {
+      // Fallback: JS-dispatch click on the trigger (works for some ATS)
+      const fallbackScript = `
+(function() {
+try {
+  var el = document.querySelector(${JSON.stringify(resolvedSel)});
+  if (!el) return false;
   var con = el.closest("[role='combobox']") || el.closest("[aria-haspopup='listbox']") || el.closest("[class*='__control']") || el.closest("[class*='SelectControl']") || el.parentElement || el;
   var trigger = con || el;
   var fire = function(t) {
@@ -612,14 +1163,13 @@ try {
   };
   fire(trigger);
   if (trigger !== el) fire(el);
-  try { if (el.tagName === "INPUT" || el.tagName === "BUTTON") el.focus(); } catch(e) {}
-  return { opened: true };
-} catch(e) {
-  return { opened: false, err: String(e.message || e) };
-}
+  return true;
+} catch(e) { return false; }
 })()`;
-    const result = await runInWebview(script, 5000, "openDropdown");
-    return result?.opened ? token : null;
+      await runInWebview(fallbackScript, 5000, "openDropdownFallback");
+    }
+
+    return { token, resolvedSelector: resolvedSel };
   };
 
   const readCustomDropdownOptionsInWebview = async (selector: string, token: string): Promise<string[]> => {
@@ -632,15 +1182,52 @@ try {
 try {
   var OPT_SEL = ${safeOptSel};
   var ATTR = ${safeAttr};
-  var el = document.querySelector(${safeSel});
-  if (!el) return [];
   var seen = {};
   var all = Array.from(document.querySelectorAll(OPT_SEL));
+  var dropdownEl = document.querySelector(${safeSel});
+
+  // Proximity filter: option must be within 300px vertically of the dropdown bottom
+  // and horizontally overlapping. Prevents cross-dropdown contamination when multiple
+  // option lists remain open in the DOM simultaneously (common in ATS systems).
+  var isNearDropdown = function(optionNode, ddEl) {
+    if (!optionNode || !ddEl) return false;
+    try {
+      var dr = ddEl.getBoundingClientRect();
+      var or = optionNode.getBoundingClientRect();
+      var verticalDistance = Math.abs(or.top - dr.bottom);
+      var horizontalOverlap = or.left < dr.right && or.right > dr.left;
+      return verticalDistance < 600 && horizontalOverlap;
+    } catch(e) { return false; }
+  };
+
+  // Fresh = nodes that appeared AFTER the snapshot (DOM-insertion pattern, e.g. React portals)
   var fresh = all.filter(function(node) { return node.getAttribute(ATTR) !== ${safeToken}; });
-  var source = fresh.length > 0 ? fresh : all;
-  return source
+
+  var candidates;
+  var visibleCount = 0;
+  var nearVisibleCount = 0;
+  if (fresh.length > 0) {
+    // DOM-insert pattern: use only the newly inserted nodes
+    candidates = fresh;
+  } else {
+    // CSS-toggle pattern: options were pre-rendered; visibility + proximity isolate
+    // this dropdown's options and prevent cross-field contamination.
+    var visible = all.filter(function(node) {
+      try { var r = node.getBoundingClientRect(); return r.height > 0 && r.width > 0; } catch(e) { return false; }
+    });
+    visibleCount = visible.length;
+    var nearVisible = visible.filter(function(node) { return isNearDropdown(node, dropdownEl); });
+    nearVisibleCount = nearVisible.length;
+    candidates = nearVisible.length > 0 ? nearVisible : visible;
+  }
+
+  var result = candidates
     .map(function(node) { return (node.textContent || "").trim().replace(/\\s+/g, " "); })
-    .filter(function(text) { return text.length >= 2 && text.length <= 120 && !seen[text] && (seen[text] = true); });
+    .filter(function(text) { return text.length >= 2 && text.length <= 300 && !seen[text] && (seen[text] = true); });
+
+  console.log("[Dropdown Read Debug]", JSON.stringify({ selector: ${safeSel}, freshCount: fresh.length, visibleCount: visibleCount, nearVisibleCount: nearVisibleCount, finalCount: result.length }));
+  console.log("[Dropdown Read]", JSON.stringify({ selector: ${safeSel}, freshCount: fresh.length, sourceCount: candidates.length, optionCount: result.length, preview: result.slice(0, 4) }));
+  return result;
 } catch(e) {
   return [];
 }
@@ -664,7 +1251,7 @@ try {
   var normT = function(t) { return String(t || "").toLowerCase().trim().replace(/\\s+/g, " "); };
   var scoreNode = function(node) {
     var t = normT(node.textContent || "");
-    if (!t || t.length > 120) return 0;
+    if (!t || t.length > 300) return 0;
     if (t === lower) return 100;
     if (t.startsWith(lower) || lower.startsWith(t)) return 80;
     if (t.includes(lower) || lower.includes(t)) return (t.length <= 40 ? 60 : 30);
@@ -705,8 +1292,44 @@ try {
     } catch(e) {}
   }
 
-  // Prefer fresh (newly appeared) nodes; fall back to all if none found
-  var candidates = fresh.length > 0 ? fresh : fresh.concat(stale);
+  // Proximity filter: option must be within 300px vertically of the dropdown bottom
+  // and horizontally overlapping. Prevents cross-dropdown contamination when multiple
+  // option lists remain open in the DOM simultaneously.
+  var dropdownEl = document.querySelector(${safeSel});
+  var isNearDropdown = function(optionNode, ddEl) {
+    if (!optionNode || !ddEl) return false;
+    try {
+      var dr = ddEl.getBoundingClientRect();
+      var or = optionNode.getBoundingClientRect();
+      var verticalDistance = Math.abs(or.top - dr.bottom);
+      var horizontalOverlap = or.left < dr.right && or.right > dr.left;
+      return verticalDistance < 600 && horizontalOverlap;
+    } catch(e) { return false; }
+  };
+
+  // Prefer fresh (DOM-insert pattern). For CSS-toggle pattern, fresh is empty — fall back
+  // to VISIBLE + spatially-near stale nodes. Proximity prevents cross-dropdown contamination
+  // when multiple option lists remain open in the DOM simultaneously.
+  var candidates;
+  var nearVisibleCount = 0;
+  if (fresh.length > 0) {
+    candidates = fresh;
+  } else {
+    var visible = stale.filter(function(n) {
+      try { var r = n.getBoundingClientRect(); return r.height > 0 && r.width > 0; } catch(e) { return false; }
+    });
+    var nearVisible = visible.filter(function(n) { return isNearDropdown(n, dropdownEl); });
+    nearVisibleCount = nearVisible.length;
+    if (nearVisible.length > 0) {
+      candidates = nearVisible;
+    } else if (visible.length > 0) {
+      candidates = visible;
+    } else {
+      candidates = stale; // Last resort
+    }
+  }
+
+  console.log("[Dropdown Select Debug]", JSON.stringify({ selector: ${safeSel}, value: val, freshCount: fresh.length, staleCount: stale.length, nearVisibleCount: nearVisibleCount, candidateCount: candidates.length }));
 
   var best = null; var bestScore = 0;
   for (var i = 0; i < candidates.length; i++) {
@@ -762,27 +1385,73 @@ try {
   };
 
   // ── APPLY USER ANSWERS: inject manually-provided answers back to form ────
-  const applyUserAnswersToForm = async (answers: Record<string, string>): Promise<void> => {
-    if (Object.keys(answers).length === 0) return;
-    for (const [selector, rawValue] of Object.entries(answers)) {
+  // Returns the set of selectors that could NOT be filled successfully.
+  const applyUserAnswersToForm = async (answers: Record<string, string>, fieldMap?: Map<string, UnfilledField>): Promise<Set<string>> => {
+    const failed = new Set<string>();
+    if (Object.keys(answers).length === 0) return failed;
+
+    const entries = Object.entries(answers);
+    for (let i = 0; i < entries.length; i++) {
+      const [selector, rawValue] = entries[i];
       const value = rawValue.trim();
       if (!value) continue;
 
-      const mode = await applyBasicFieldAnswer(selector, value);
-      if (mode === "done" || mode === "missing" || mode === "skip") {
-        await sleep(120);
-        continue;
+      const field = fieldMap?.get(selector);
+      const fieldType = field?.fieldType ?? "text";
+
+      setStatus(`Filling field ${i + 1}/${entries.length}: "${field?.label ?? "field"}"...`);
+
+      // Scroll to field first
+      await humanScrollToField(selector);
+      await sleep(randomBetween(300, 500));
+      await humanHighlightField(selector, true);
+      await sleep(randomBetween(200, 300));
+
+      let success = false;
+
+      if (fieldType === "custom-select") {
+        success = await humanFillCustomDropdown(selector, value);
+        if (!success) {
+          // Fallback: try native select or typing
+          const nativeOk = await humanSelectNativeOption(selector, value);
+          if (!nativeOk) {
+            success = await humanTypeInField(selector, value);
+          } else {
+            success = true;
+          }
+        }
+      } else if (fieldType === "select") {
+        success = await humanSelectNativeOption(selector, value);
+      } else {
+        // text / textarea — human type
+        success = await humanTypeInField(selector, value);
       }
 
-      const token = await openCustomDropdownInWebview(selector);
-      if (!token) continue;
+      await humanHighlightField(selector, false);
 
-      await sleep(700);
-      const matched = await selectCustomDropdownOptionInWebview(selector, token, value);
-      if (!matched) await applyBasicFieldAnswer(selector, value);
-      await closeCustomDropdownInWebview(selector, token);
-      await sleep(180);
+      if (!success) {
+        // Last-resort: try the basic instant approach
+        const mode = await applyBasicFieldAnswer(selector, value);
+        if (mode === "done") {
+          success = true;
+        } else if (mode === "custom") {
+          const opened = await openCustomDropdownInWebview(selector);
+          if (opened) {
+            await sleep(700);
+            const matched = await selectCustomDropdownOptionInWebview(opened.resolvedSelector, opened.token, value);
+            await closeCustomDropdownInWebview(opened.resolvedSelector, opened.token);
+            success = matched;
+          }
+        }
+      }
+
+      if (!success) failed.add(selector);
+
+      // Pause between fields
+      await sleep(randomBetween(400, 700));
     }
+
+    return failed;
   };
 
   // ── FETCH OPTIONS FOR CLOSED CUSTOM DROPDOWNS ────────────────────────────
@@ -810,28 +1479,44 @@ try {
 })()`;
     const inspected = await runInWebview(inspectScript, 5000, "inspectDropdown");
     if (inspected?.kind === "select") return Array.isArray(inspected.options) ? inspected.options : [];
-    if (inspected?.kind !== "custom") return [];
+    // For custom AND other (div-based comboboxes), try opening
+    if (inspected?.kind === "missing") return [];
 
-    const token = await openCustomDropdownInWebview(selector);
-    if (!token) return [];
+    const opened = await openCustomDropdownInWebview(selector);
+    if (!opened) return [];
 
     await sleep(700);
-    const options = await readCustomDropdownOptionsInWebview(selector, token);
-    await closeCustomDropdownInWebview(selector, token);
+    const options = await readCustomDropdownOptionsInWebview(opened.resolvedSelector, opened.token);
+    await closeCustomDropdownInWebview(opened.resolvedSelector, opened.token);
     await sleep(180);
     return options;
   };
 
-  // Enriches unfilled fields that are custom-selects with no options by opening their dropdowns.
+  // Enriches each custom-select field independently: open → read → close per field.
+  // Each field gets its own token; NO state is shared between iterations.
   const enrichUnfilledWithOptions = async (fields: UnfilledField[]): Promise<UnfilledField[]> => {
     const enriched = [...fields];
     for (let i = 0; i < enriched.length; i++) {
       const f = enriched[i];
-      if ((f.fieldType === "custom-select" || f.fieldType === "select") && f.options.length === 0) {
-        await sleep(300);
-        const opts = await fetchDropdownOptions(f.selector);
-        if (opts.length > 0) enriched[i] = { ...f, options: opts };
+      if (f.fieldType !== "custom-select" || f.options.length > 0) continue;
+
+      console.log(`[AutoApply:enrich] Dropdown ${i + 1}/${enriched.length}: "${f.label}" selector="${f.selector}"`);
+      await sleep(300);
+
+      const opened = await openCustomDropdownInWebview(f.selector);
+      if (!opened) {
+        console.warn(`[AutoApply:enrich] Failed to open dropdown for "${f.label}"`);
+        continue;
       }
+
+      await sleep(700);
+      const opts = await readCustomDropdownOptionsInWebview(opened.resolvedSelector, opened.token);
+      console.log(`[AutoApply:enrich] "${f.label}" → ${opts.length} options:`, opts.slice(0, 5));
+
+      await closeCustomDropdownInWebview(opened.resolvedSelector, opened.token);
+      await sleep(300);
+
+      if (opts.length > 0) enriched[i] = { ...f, options: opts };
     }
     return enriched;
   };
@@ -846,84 +1531,164 @@ try {
     setAutoModeRunning(true);
     setStatus("Auto mode running...");
 
-    let totalFilled = 0;
     try {
       for (let step = 0; step < 12; step++) {
         if (loopTokenRef.current !== token) break;
 
+        // ── Step 1: Locate form / click Apply ──────────────────────────
         setStatus("Looking for application form...");
         const locate = await locateForm();
 
         if (loopTokenRef.current !== token) break;
-        if (locate === null) break; // navigation race — restart already queued by nav handler
-
+        if (locate === null) break;
         setStatus(locate.message);
 
-        // If we clicked Apply, navigation will fire and onNavigate queues the restart.
-        if (locate.clicked) break;
+        if (locate.clicked) break; // clicked Apply — nav handler will restart
 
-        await sleep(500);
+        await sleep(randomBetween(500, 900));
         if (loopTokenRef.current !== token) break;
 
-        setStatus("Filling fields...");
-        const fill = await fillForm();
+        // ── Step 2: Extract all fields (no filling yet) ────────────────
+        setStatus("Reading form fields...");
+        const fields = await extractFormFields();
 
         if (loopTokenRef.current !== token) break;
-        if (fill === null) break; // navigation race
-
-        setStatus(fill.message);
-        totalFilled += fill.filled;
-
-        if (fill.unfilled.length > 0) {
-          const enriched = await enrichUnfilledWithOptions(fill.unfilled);
-
-          // Auto-apply custom dropdown fields where we already know the answer
-          const autoApply: Record<string, string> = {};
-          for (const f of enriched) {
-            if ((f.fieldType === "custom-select") && f.autoValue) {
-              autoApply[f.selector] = f.autoValue;
-            }
-          }
-          if (Object.keys(autoApply).length > 0) {
-            setStatus("Applying dropdown answers...");
-            await applyUserAnswersToForm(autoApply);
-            await sleep(400);
-            totalFilled += Object.keys(autoApply).length;
-          }
-
-          // Show remaining unfilled (no autoValue or autoApply failed)
-          const stillUnfilled = enriched.filter(f => !f.autoValue || f.fieldType !== "custom-select");
-          setUnfilledFields(stillUnfilled);
-          const pre: Record<string, string> = {};
-          for (const f of stillUnfilled) {
-            const saved = profileRef.current.answers?.[f.label];
-            if (saved) pre[f.selector] = saved;
-          }
-          if (Object.keys(pre).length > 0) setUserAnswers((prev) => ({ ...prev, ...pre }));
-          if (fill.filled === 0 && Object.keys(autoApply).length === 0) {
-            setStatus(`${stillUnfilled.length} field(s) need your input — answer below and click "Apply & Save".`);
-            break;
-          }
-        }
-
-        await sleep(500);
-        if (loopTokenRef.current !== token) break;
-
-        const advance = await advanceForm();
-        if (loopTokenRef.current !== token) break;
-        if (advance === null) break;
-
-        setStatus(advance.message);
-
-        if (advance.isSubmit) {
-          if (totalFilled === 0) { setStatus("Safety stop: not submitting — no fields were filled."); }
-          else { setStatus("Application submitted!"); }
+        if (!fields || fields.length === 0) {
+          setStatus("No form fields found.");
           break;
         }
 
-        if (!advance.clicked && fill.filled === 0) { setStatus("No progress — auto mode stopped."); break; }
+        setStatus(`Found ${fields.length} field(s). Filling one by one...`);
+        await sleep(randomBetween(400, 800));
 
-        await sleep(700);
+        // ── Step 3: Process each field sequentially like a human ───────
+        let totalFilled = 0;
+        const needsInput: UnfilledField[] = [];
+
+        for (let fi = 0; fi < fields.length; fi++) {
+          if (loopTokenRef.current !== token) break;
+
+          const field = fields[fi];
+
+          // Skip if already correctly filled.
+          // text/textarea: any existing content = skip (don't overwrite user-typed data).
+          // select/custom-select: a pre-selected default (e.g. "United States") is NOT filled —
+          //   only skip if the current value already matches what we would fill.
+          if (field.existingValue && field.existingValue.length > 1) {
+            if (field.fieldType === "text" || field.fieldType === "textarea") continue;
+            if (field.suggestedValue && field.existingValue.toLowerCase() === field.suggestedValue.toLowerCase()) continue;
+            if (!field.suggestedValue) continue; // no answer to fill, nothing to do
+          }
+
+          setStatus(`Field ${fi + 1}/${fields.length}: "${field.label}"`);
+
+          // Scroll to the field so user can see it
+          await humanScrollToField(field.selector);
+          await sleep(randomBetween(300, 600));
+
+          // Highlight the current field
+          await humanHighlightField(field.selector, true);
+          await sleep(randomBetween(200, 400));
+
+          if (field.suggestedValue) {
+            // We know the answer — fill it human-like
+            let filled = false;
+
+            if (field.fieldType === "text" || field.fieldType === "textarea") {
+              filled = await humanTypeInField(field.selector, field.suggestedValue);
+            } else if (field.fieldType === "select") {
+              filled = await humanSelectNativeOption(field.selector, field.suggestedValue);
+            } else if (field.fieldType === "custom-select") {
+              filled = await humanFillCustomDropdown(field.selector, field.suggestedValue);
+            }
+
+            // Remove highlight
+            await humanHighlightField(field.selector, false);
+
+            if (filled) {
+              totalFilled++;
+              setStatus(`✓ Filled "${field.label}"`);
+            } else {
+              // Fill failed — fetch options for dropdown types before showing in panel
+              if ((field.fieldType === "custom-select" || field.fieldType === "select") && field.options.length === 0) {
+                setStatus(`Reading options for "${field.label}"...`);
+                const opts = await fetchDropdownOptions(field.selector);
+                field.options = opts;
+              }
+              needsInput.push({
+                label: field.label,
+                selector: field.selector,
+                fieldType: field.fieldType === "custom-select" ? "custom-select" : field.fieldType === "select" ? "select" : field.fieldType === "textarea" ? "textarea" : "text",
+                options: field.options,
+                autoValue: field.suggestedValue,
+              });
+            }
+
+            // Pause between fields like a human
+            await sleep(randomBetween(400, 900));
+          } else {
+            // No known answer — collect for user input panel
+            await humanHighlightField(field.selector, false);
+
+            if ((field.fieldType === "custom-select" || field.fieldType === "select") && field.options.length === 0) {
+              // Open dropdown / read native select to extract options for the panel
+              setStatus(`Reading options for "${field.label}"...`);
+              const opts = await fetchDropdownOptions(field.selector);
+              field.options = opts;
+              await sleep(randomBetween(200, 400));
+            }
+
+            needsInput.push({
+              label: field.label,
+              selector: field.selector,
+              fieldType: field.fieldType === "custom-select" ? "custom-select" : field.fieldType === "select" ? "select" : field.fieldType === "textarea" ? "textarea" : "text",
+              options: field.options,
+              autoValue: "",
+            });
+          }
+        }
+
+        if (loopTokenRef.current !== token) break;
+
+        // ── Step 4: Show unfilled fields panel if any ──────────────────
+        if (needsInput.length > 0) {
+          setUnfilledFields(needsInput);
+
+          // Pre-populate from saved profile answers
+          const pre: Record<string, string> = {};
+          for (const f of needsInput) {
+            const saved = profileRef.current.answers?.[f.label];
+            if (saved) pre[f.selector] = saved;
+            if (f.autoValue) pre[f.selector] = f.autoValue;
+          }
+          if (Object.keys(pre).length > 0) setUserAnswers((prev) => ({ ...prev, ...pre }));
+
+          setStatus(`Filled ${totalFilled} field(s). ${needsInput.length} need your input — answer below.`);
+          break;
+        }
+
+        // ── Step 5: Advance form (Next / Submit) ───────────────────────
+        await sleep(randomBetween(500, 1000));
+        if (loopTokenRef.current !== token) break;
+
+        setStatus("Looking for Next / Submit...");
+        const advance = await advanceForm();
+        if (loopTokenRef.current !== token) break;
+        if (advance === null) break;
+        setStatus(advance.message);
+
+        if (advance.isSubmit) {
+          if (totalFilled === 0) setStatus("Safety stop: not submitting — no fields were filled.");
+          else setStatus("Application submitted!");
+          break;
+        }
+
+        if (!advance.clicked && totalFilled === 0) {
+          setStatus("No progress — auto mode stopped.");
+          break;
+        }
+
+        await sleep(randomBetween(800, 1500));
       }
     } finally {
       if (loopTokenRef.current === token || loopTokenRef.current === 0) {
@@ -951,20 +1716,27 @@ try {
 
   const handleSaveAndApply = async () => {
     const toApply: Record<string, string> = {}; const labelMap: Record<string, string> = {};
+    const fieldInfoMap = new Map<string, UnfilledField>();
     for (const field of unfilledFields) {
       const v = userAnswers[field.selector]; if (!v?.trim()) continue;
       toApply[field.selector] = v.trim(); labelMap[field.label] = v.trim();
+      fieldInfoMap.set(field.selector, field);
     }
     if (Object.keys(toApply).length === 0) return;
     setSavingAnswers(true);
     try {
-      await applyUserAnswersToForm(toApply);
+      const failedOnSave = await applyUserAnswersToForm(toApply, fieldInfoMap);
       const updated: UserProfile = { ...profileRef.current, answers: { ...(profileRef.current.answers ?? {}), ...labelMap } };
       saveProfile(updated);
       await putProfile(updated).catch(() => {});
       onProfileUpdate?.(updated);
-      setUnfilledFields((prev) => prev.filter((f) => !toApply[f.selector]));
-      setStatus(`Applied ${Object.keys(toApply).length} answer(s) and saved to profile.`);
+      // Remove fields that were successfully applied; keep failed ones in panel so user can retry
+      setUnfilledFields((prev) => prev.filter((f) => !toApply[f.selector] || failedOnSave.has(f.selector)));
+      if (failedOnSave.size > 0) {
+        setStatus(`Applied ${Object.keys(toApply).length - failedOnSave.size} answer(s). ${failedOnSave.size} field(s) could not be filled — please try again.`);
+      } else {
+        setStatus(`Applied ${Object.keys(toApply).length} answer(s) and saved to profile.`);
+      }
     } finally { setSavingAnswers(false); }
   };
   // ── JSX ──────────────────────────────────────────────────────────────────
@@ -1071,7 +1843,7 @@ try {
             <div className="divide-y divide-slate-100 px-4 pb-2 pt-1">
               {unfilledFields.map((field) => (
                 <div key={field.selector} className="py-3">
-                  <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{field.label}</label>
+                  <label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{field.label || `Field ${unfilledFields.indexOf(field) + 1}`}</label>
                   {(field.fieldType === "select" || field.fieldType === "custom-select") && field.options.length > 0 ? (
                     <select
                       className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm transition focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
